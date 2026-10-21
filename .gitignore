@@ -1,0 +1,37 @@
+# Environment secrets
+.env
+*.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Local logs
+*.log
+
+# PDFs: only the synthetic demo PDF is allowed in the repository
+*.pdf
+!data/project_aurora_sample.pdf
+
+# System / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
