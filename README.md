@@ -10,6 +10,8 @@
 
 # Ask My PDF — Retrieval-Augmented Generation Assistant
 
+**Developed by Team 2**
+
 > **Educational project disclaimer.** This repository is a student learning project created for a training workshop. It is **not** an official SDAIA or SDAIA Academy product, and it is not endorsed, reviewed, or maintained by SDAIA or SDAIA Academy. The SDAIA Academy name and logo are used only to acknowledge the educational context of the workshop. The software is provided as-is, without warranty; it can produce incorrect answers and must not be used for decisions that matter without checking the cited source pages.
 
 ---
@@ -47,7 +49,7 @@ The pipeline is deliberately simple so every step can be inspected: PyMuPDF extr
 
 An **offline simulation mode** lets the whole pipeline and its tests run without an API key. That mode is a rule-based stand-in for the model, and this README is explicit about which results come from it.
 
-**Current verified status (2026-10-22):** 21 of 21 offline tests pass. Live Gemini answers were **not** re-verified in this review (see [§13](#13-testing-methodology-and-actual-results)).
+**Current verified status (2026-10-22):** 28 of 28 automated tests pass (27 offline tests plus 1 test of the live code path against a mocked Gemini client). Real Gemini answers were **not** independently verified in this review (see [§13](#13-testing-methodology-and-actual-results)).
 
 ## 2. Problem statement and intended users
 
@@ -82,7 +84,7 @@ Reading a long PDF to find one fact is slow, and general-purpose chatbots may an
 | Refusal when evidence is missing (English and Arabic) | `gemini_service.py` | Tested offline; live behavior relies on the system instruction |
 | Prompt-injection defenses (untrusted-excerpt framing + system rules; keyword guard offline) | `gemini_service.py` | Tested offline only |
 | `get_document_stats` tool with input validation | `gemini_service.py` | Working (tested directly) |
-| Gemini function calling for the tool | `gemini_service.py` | Implemented; **not verified live** |
+| Gemini function calling for the tool | `gemini_service.py` | Implemented (single round-trip, no loop); verified with a mocked client (T28), **not verified with real Gemini** |
 | Offline simulation mode (no key needed) | `gemini_service.py` | Working; rule-based |
 | Document overview (pages, words, chunk count) and retrieved-passage viewer with scores | `app.py` | Working (observed manually earlier; not re-checked in this review) |
 | SDAIA Academy branding in the UI | `app.py` | Working (observed manually earlier) |
@@ -113,7 +115,7 @@ flowchart TD
     C --> D["TF-IDF index<br/>(scikit-learn)"]
 
     Q["User question"] --> S{"Summary<br/>question?"}
-    S -- yes --> SP["Representative chunks<br/>from first pages"]
+    S -- yes --> SP["Representative chunks<br/>sampled across pages"]
     S -- no --> L["Arabic keyword mapping<br/>(if Arabic)"]
     L --> F["Cosine similarity<br/>top 3 chunks + scores"]
     D --> F
@@ -141,7 +143,7 @@ More detail, including exact thresholds: [`docs/architecture.md`](docs/architect
 4. **Chunking.** `chunk_pages` splits each page into chunks of up to 150 words with 30 words of overlap. Each chunk has an id like `p2_c1` and its exact page number.
 5. **Indexing.** `TFIDFRetriever` builds a TF-IDF matrix (unigrams and bigrams, English stop words removed).
 6. **Retrieval.** For each question:
-   - overview questions ("summarize", "what is this about", "عن إيش يتكلم") return the first chunk of up to three pages;
+   - overview questions ("summarize", "what's this PDF about?", "عن إيش يتكلم") return the first chunk of up to four pages, sampled evenly from the start, middle, and end of the document;
    - Arabic questions are mapped to English keywords when they match the lexicon;
    - otherwise the three chunks with the highest cosine similarity are returned, **including zero-score chunks** so the next step can see there is no evidence.
 7. **Generation.**
@@ -170,15 +172,15 @@ It is used in three ways: called by Gemini through function calling (live mode),
 | :--- | :--- | :--- |
 | When used | `GEMINI_API_KEY` set to a real value | No key, placeholder key, `offline=True` (all tests), or fallback after an API error |
 | Who writes the answer | Gemini 2.5 Flash, temperature 0 | Python rules in `_offline_grounded_answer` |
-| Tool use | `get_document_stats` is passed to Gemini as a tool. The `google-genai` SDK's automatic function calling can execute it; a manual branch also handles returned function calls | Keyword match ("how many pages", "عدد الصفحات", …) calls the function directly; **this is not model function calling** |
+| Tool use | `get_document_stats` is declared to Gemini as a tool. The SDK's automatic function calling is **disabled**; if Gemini requests the tool, the app runs it once and sends the result back in one follow-up request (no loop) | Keyword match ("how many pages", "عدد الصفحات", …) calls the function directly; **this is not model function calling** |
 | Grounding and citations | Required by the system instruction; depends on model compliance | Answers come from templates that only fire when the fact string is in a retrieved chunk, or from the first sentence of the top chunk |
 | Prompt-injection defense | Excerpts framed as untrusted; system rules | Keyword list |
 | Works on any PDF? | Intended to | Partly: fact templates only cover the synthetic test PDF; other PDFs get extractive or refusal answers |
-| Verified in this review? | **No** | **Yes** (21 tests) |
+| Verified in this review? | Code path verified with a **mocked** client (T28); **real Gemini output not verified** | **Yes** (27 tests) |
 
 **Plain extraction (no model in either mode):** page text, page count, word count, chunking, and TF-IDF scores.
 
-If a live call fails for any reason other than an invalid key or quota limit, the app falls back to the offline engine and appends *"(Note: Generated via offline engine due to API connection issue)"*. Each live request has a 60-second timeout.
+Error handling in live mode: authentication (401), permission (403), model-not-found (404) and quota (429) errors return a clear warning instead of an answer. A network timeout (20 seconds per request) or any other error falls back to the offline engine, and the answer ends with a notice saying the local engine was used.
 
 ## 10. Repository structure
 
@@ -199,7 +201,7 @@ ask-my-pdf-rag/
 ├── notebooks/
 │   └── project_demo.ipynb      # Reproducible offline walkthrough
 ├── tests/
-│   └── test_ask_my_pdf.py      # 21 offline tests
+│   └── test_ask_my_pdf.py      # 28 tests (27 offline + 1 mocked live path)
 └── docs/
     ├── architecture.md
     ├── test_results.md
@@ -278,7 +280,7 @@ Then choose *Run → Run All Cells*. The notebook imports the real project modul
 
 The tests build a synthetic 3-page PDF whose Page 3 contains a deliberate prompt-injection line, then run the real extraction, chunking, retrieval, and tool code. Answers are produced by the **offline simulation**, so the tests check the pipeline and the safety logic, not the quality of the Gemini model.
 
-**Latest run (2026-10-22, Windows 11, Python 3.10.0): 21 passed, 0 failed.**
+**Latest run (2026-10-22, Windows 11, Python 3.10.0): 28 passed, 0 failed.**
 
 | Group | Tests | Result |
 | :--- | :--- | :--- |
@@ -287,7 +289,9 @@ The tests build a synthetic 3-page PDF whose Page 3 contains a deliberate prompt
 | Invalid tool arguments | T09–T10 | 2/2 pass |
 | Prompt injection (PDF text, user query) | T11–T12 | 2/2 pass |
 | Arabic and summary regressions | T13–T19 | 7/7 pass |
-| Added in this review: summary on a different PDF; known Arabic limitation | T20–T21 | 2/2 pass |
+| Summary on a different PDF; known Arabic limitation | T20–T21 | 2/2 pass |
+| Summary phrasing, summaries of other PDFs, coverage note, factual retrieval and refusal on a second PDF | T22–T27 | 6/6 pass |
+| Live function-calling code path with a **mocked** Gemini client (no network) | T28 | 1/1 pass |
 
 T01–T12 are the 12 workshop tests. The full table with each question, expected result, and actual output is in [`docs/test_results.md`](docs/test_results.md).
 
@@ -299,12 +303,35 @@ T01–T12 are the 12 workshop tests. The full table with each question, expected
 
 **Live Gemini tests:** none were run in this review, so no live accuracy is claimed. An earlier run reported "12 passed in 22.02 s" for the original 12 tests; that is historical and has been superseded by the run above.
 
+### Arabic demonstration on a real project document (team-reported)
+
+The team reports that the running app answered Arabic questions about its own project document, *Secret of Hegra* (a one-page English PDF; **not included in this repository**), including questions about the technologies it uses (Unity and Meta Quest 3). This review checked what can be checked without a live API call:
+
+| Question on *Secret of Hegra* | Offline engine result (re-run 2026-10-22) |
+| :--- | :--- |
+| "عن إيش يتكلم؟" (what is it about?) | Summary path; extractive overview citing `[Page 1]` |
+| "ما هي التقنيات المستخدمة في المشروع؟" (what technologies are used?) | TF-IDF score 0.0000 → refusal |
+| "Does the project use Unity and Meta Quest 3?" | Score 0.2144; returns the title line only, not the technologies |
+
+So the offline engine does **not** reproduce the technology answers. If the app answered them correctly, that answer came from live Gemini reading the retrieved page, which **has not been independently verified** here. Re-run these questions with a rotated key and record the answers before presenting them as evidence.
+
+### Verified vs. not verified
+
+| Verified in this review | Not independently verified |
+| :--- | :--- |
+| Extraction, chunking, page numbers, page/word counts | Real Gemini answer quality, citations, and refusals |
+| TF-IDF retrieval and scores; summary sampling | Gemini resisting prompt injection |
+| `get_document_stats` results and input validation | Gemini actually choosing to call the tool |
+| Offline engine answers, refusals, injection guard (27 tests) | That the 20 s timeout fixes the earlier hang |
+| Live tool round-trip code with a mocked client (T28) | Team-reported Hegra / Unity / Meta Quest 3 answers |
+| App starts without errors (headless Streamlit check) | Full UI walkthrough in a browser |
+
 ## 14. Security
 
 - **API keys.** Loaded from `.env` only; `.env.example` holds a placeholder. The UI reports whether a key is present but never displays it. A key was shown in an earlier version of the interface; **that key must be treated as compromised and rotated** before further live use. Before the first commit, the repository files were checked for key-like strings and none were found.
 - **Prompt injection.** Retrieved text is labeled as untrusted reference material, and the system instruction forbids following instructions inside it or changing persona. Offline, a keyword guard refuses common injection phrases. These measures reduce but do not eliminate risk, and live resistance has not been re-verified.
 - **Grounding.** The system instruction requires answers only from excerpts, `[Page X]` citations, and a fixed refusal sentence when evidence is missing. Retrieved passages and scores are shown under every answer so users can check them. This does not guarantee correct answers.
-- **Error handling.** Invalid PDFs, invalid keys, and quota errors produce clear messages; requests time out after 60 s; other API errors fall back to offline mode with a visible note.
+- **Error handling.** Invalid PDFs and 401/403/404/429 API errors produce clear messages; requests time out after 20 s; timeouts and other API errors fall back to offline mode with a visible notice.
 - **Tool surface.** One read-only tool with one validated string argument; no file, shell, or network access.
 - **Data.** Only synthetic data is in the repository; `.gitignore` excludes `.env`, other PDFs, virtual environments, caches, and logs. In live mode, excerpts are sent to Google's API, so do not upload confidential documents.
 
@@ -313,7 +340,7 @@ More: [`docs/limitations.md`](docs/limitations.md#2-security-considerations).
 ## 15. Known issues
 
 1. **Arabic questions about English PDFs only partly work.** The original problem (TF-IDF score 0.0000 for Arabic questions) is addressed by a keyword lexicon that covers about ten topics, several tuned to the synthetic PDF. Other Arabic questions still score 0.0 and are refused (test T21).
-2. **Earlier hanging Gemini request: root cause not confirmed.** A 60 s timeout was added; whether that resolves the original hang has not been tested live.
+2. **Earlier hanging Gemini request: root cause not confirmed.** A 20 s request timeout and a no-loop, single tool round-trip are now in place; whether they resolve the original hang has not been independently tested live.
 3. **Live Gemini path not re-verified** (answers, citations, refusals, function calling).
 4. **Offline engine is document-specific** for factual answers.
 5. **Silent fallback** to offline mode on unexpected API errors may be missed by users (a note is appended).
@@ -323,7 +350,7 @@ More: [`docs/limitations.md`](docs/limitations.md#2-security-considerations).
 
 ## 16. Deployment status
 
-**Local only.** The app runs on `http://localhost:8501` on the developer's computer. There is no public deployment, and public deployment is not required by the workshop. Before any shared deployment: rotate the key, use a secret manager, escape user-controlled HTML, move the registry into session state, and add upload limits.
+**Local only.** The app runs on `http://localhost:8501` on a local computer. There is no public deployment, and public deployment is not required by the workshop. Before any shared deployment: rotate the key, use a secret manager, escape user-controlled HTML, move the registry into session state, and add upload limits.
 
 ## 17. Five-minute demonstration guide
 
@@ -347,7 +374,7 @@ Script and backup plan: [`docs/demo_guide.md`](docs/demo_guide.md). State during
 | 2 | Synthetic sample data, at least five items | `data/project_aurora_sample.pdf` (3 pages, 8 facts), `data/sample_questions.json` (9 items) |
 | 3 | Working retrieval with traceable sources | `retriever.py`; page + score shown per chunk |
 | 4 | Real tool with input validation and accurate result | `get_document_stats`, tests T06, T09, T10 |
-| 5 | Twelve diverse tests | T01–T12 (+ 9 regression tests) |
+| 5 | Twelve diverse tests | T01–T12 (+ 16 regression tests) |
 | 6 | Runnable notebook, synthetic data, test table, README | `notebooks/`, `data/`, `docs/test_results.md`, this file |
 | 7 | Honest separation of real model, simulated, and plain extraction | [§9](#9-real-gemini-function-calling-vs-offline-simulation) |
 | 8 | Documented success and failure/refusal with evidence | [§13](#13-testing-methodology-and-actual-results) |
@@ -369,6 +396,7 @@ Script and backup plan: [`docs/demo_guide.md`](docs/demo_guide.md). State during
 
 ## 20. Credits
 
+- **Developed by Team 2** as a team final project.
 - **SDAIA Academy** (Saudi Data & Artificial Intelligence Authority Academy), for the *Developing Generative AI Solutions* training workshop, whose final-project requirements shaped this work. The logo is shown solely to acknowledge that educational context; no official endorsement or affiliation is implied.
 - Open-source libraries: [Streamlit](https://streamlit.io/), [PyMuPDF](https://pymupdf.readthedocs.io/), [scikit-learn](https://scikit-learn.org/), [google-genai](https://github.com/googleapis/python-genai), [python-dotenv](https://github.com/theskumar/python-dotenv), [pytest](https://pytest.org/).
 - Google Gemini API for live generation.

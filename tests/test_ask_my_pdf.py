@@ -100,6 +100,38 @@ def processed_doc(synthetic_pdf_path):
     }
 
 
+@pytest.fixture(scope="module")
+def second_processed_doc(tmp_path_factory):
+    """Create a second distinct synthetic test PDF (deep_sea_research.pdf) to test dynamic summaries."""
+    temp_dir = tmp_path_factory.mktemp("second_fixtures")
+    pdf_path = os.path.join(temp_dir, "deep_sea_research.pdf")
+
+    doc = fitz.open()
+    p1 = doc.new_page()
+    p1.insert_text((50, 72), "Deep Sea Oceanographic Research Initiative.\nCaptain Marcus Vance leads the hydrothermal vent exploration.")
+    p2 = doc.new_page()
+    p2.insert_text((50, 72), "Deep Sea Robotics Instrumentation.\nThe autonomous submarine uses titanium pressure hulls certified to 11000 meters depth.")
+    p3 = doc.new_page()
+    p3.insert_text((50, 72), "Environmental Conservation Findings.\nThe survey identified 47 previously unknown bioluminescent invertebrate species.")
+    doc.save(pdf_path)
+    doc.close()
+
+    doc_id = "deep_sea_research.pdf"
+    pages = extract_pages_from_pdf(pdf_path)
+    chunks = chunk_pages(pages)
+    metrics = compute_document_metrics(pages)
+
+    register_document(doc_id, metrics["page_count"], metrics["word_count"])
+    retriever = TFIDFRetriever(chunks)
+    return {
+        "doc_id": doc_id,
+        "pages": pages,
+        "chunks": chunks,
+        "metrics": metrics,
+        "retriever": retriever
+    }
+
+
 # ============================================================================
 # 6 ANSWERABLE TESTS
 # ============================================================================
@@ -390,3 +422,166 @@ def test_21_known_limitation_arabic_outside_lexicon(processed_doc):
 
     answer = answer_question(query, top_chunks, processed_doc["doc_id"], offline=True)
     assert "لا يمكنني الإجابة" in answer
+
+
+# ============================================================================
+# NEW REGRESSION TESTS: DYNAMIC MULTI-DOCUMENT SUMMARIES & COVERAGE LIMITS
+# Note: These tests explicitly exercise the deterministic offline fallback engine.
+# ============================================================================
+
+def test_22_english_summary_variations_aurora(processed_doc):
+    """Test 22: Verify 'What's the PDF about?' and 'What's this PDF about?' trigger the summary path.
+    
+    Mode: Offline fallback engine.
+    """
+    queries = ["What's the PDF about?", "What's this PDF about?", "Summarize this document"]
+    for q in queries:
+        top_chunks = processed_doc["retriever"].retrieve(q, top_k=3)
+        assert len(top_chunks) > 0
+        assert any(c.get("retrieval_mode") == "summary" for c in top_chunks)
+
+        answer = answer_question(q, top_chunks, processed_doc["doc_id"], offline=True)
+        assert "Project Aurora" in answer
+        assert "[Page 1]" in answer
+        assert "not present in the document" not in answer.lower()
+
+
+def test_23_dynamic_summary_second_pdf(second_processed_doc):
+    """Test 23: Verify summaries are dynamically extracted from the actual PDF, NOT hardcoded text.
+    
+    Mode: Offline fallback engine on second synthetic document (deep_sea_research.pdf).
+    """
+    doc_id = second_processed_doc["doc_id"]
+    retriever = second_processed_doc["retriever"]
+    top_chunks = retriever.retrieve("What's the PDF about?", top_k=3)
+
+    answer = answer_question("What's the PDF about?", top_chunks, doc_id, offline=True)
+
+    # Must contain text from the second PDF
+    assert "Deep Sea Oceanographic Research" in answer or "Captain Marcus Vance" in answer
+    assert "[Page 1]" in answer
+    # Must NOT contain text from Project Aurora
+    assert "Aurora" not in answer
+    assert "Rostova" not in answer
+
+
+def test_24_arabic_summary_second_pdf(second_processed_doc):
+    """Test 24: Verify Arabic summary query on the second PDF produces dynamic content without hardcoding.
+    
+    Mode: Offline fallback engine on second synthetic document (deep_sea_research.pdf).
+    """
+    doc_id = second_processed_doc["doc_id"]
+    retriever = second_processed_doc["retriever"]
+
+    top_chunks = retriever.retrieve("عن إيش يتكلم هذا المستند؟", top_k=3)
+    answer = answer_question("عن إيش يتكلم هذا المستند؟", top_chunks, doc_id, offline=True)
+
+    assert "Deep Sea" in answer or "Marcus Vance" in answer
+    assert "[Page 1]" in answer
+    assert "Aurora" not in answer
+
+
+def test_25_coverage_limitation_note_multi_page_pdf(tmp_path):
+    """Test 25: Verify large multi-page PDFs include a clear coverage limitation note in summaries.
+    
+    Mode: Offline fallback engine on a 7-page synthetic document.
+    """
+    pdf_path = str(tmp_path / "seven_page_report.pdf")
+    doc = fitz.open()
+    for i in range(1, 8):
+        p = doc.new_page()
+        p.insert_text((50, 72), f"Chapter {i} Technical Analysis.\nDetailed operational logs for sector {i} with baseline telemetry.")
+    doc.save(pdf_path)
+    doc.close()
+
+    doc_id = "seven_page_report.pdf"
+    pages = extract_pages_from_pdf(pdf_path)
+    chunks = chunk_pages(pages)
+    metrics = compute_document_metrics(pages)
+
+    clear_document_registry()
+    register_document(doc_id, metrics["page_count"], metrics["word_count"])
+
+    retriever = TFIDFRetriever(chunks)
+    top_chunks = retriever.retrieve("What's this PDF about?", top_k=3)
+
+    answer = answer_question("What's this PDF about?", top_chunks, doc_id, offline=True)
+
+    # Must contain the coverage note for the 7-page document
+    assert "Coverage Note" in answer
+    assert "7-page document" in answer
+    assert "[Page 1]" in answer
+
+
+def test_26_ordinary_factual_retrieval_still_precise(second_processed_doc):
+    """Test 26: Ordinary factual questions must continue using retrieval and cite exact pages without hallucination.
+    
+    Mode: Offline fallback engine on second synthetic document.
+    """
+    doc_id = second_processed_doc["doc_id"]
+    retriever = second_processed_doc["retriever"]
+
+    query = "What depth is the titanium hull certified to?"
+    top_chunks = retriever.retrieve(query, top_k=3)
+    answer = answer_question(query, top_chunks, doc_id, offline=True)
+
+    assert "11000 meters" in answer
+    assert "[Page 2]" in answer
+
+
+def test_27_out_of_scope_unsupported_refusal(second_processed_doc):
+    """Test 27: Out-of-scope questions on any document must refuse and not invent unsupported facts.
+    
+    Mode: Offline fallback engine on second synthetic document.
+    """
+    doc_id = second_processed_doc["doc_id"]
+    retriever = second_processed_doc["retriever"]
+
+    query = "Who won the FIFA World Cup in 2022?"
+    top_chunks = retriever.retrieve(query, top_k=3)
+    answer = answer_question(query, top_chunks, doc_id, offline=True)
+
+    assert "cannot answer" in answer.lower() or "not present" in answer.lower()
+    assert "Argentina" not in answer
+
+
+def test_28_live_tool_calling_path_with_mocked_client(processed_doc, monkeypatch):
+    """Test 28: Exercise the live function-calling code path against a MOCKED Gemini client.
+
+    No network or API key is used. Verifies that when the model requests
+    get_document_stats, the tool runs and its result is sent back in a
+    well-formed follow-up request (instead of falling back to offline mode).
+    """
+    from google import genai
+    from google.genai import types
+
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            calls.append(contents)
+            if len(calls) == 1:
+                fc = types.FunctionCall(name="get_document_stats", args={"doc_id": processed_doc["doc_id"]})
+                return types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(role="model", parts=[types.Part(function_call=fc)]))])
+            tool_part = contents[2].parts[0].function_response
+            stats = tool_part.response["result"]
+            return types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(role="model", parts=[types.Part.from_text(
+                    text=f"The document has {stats['page_count']} pages.")]))])
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.models = FakeModels()
+
+    # Earlier tests replace the registry contents, so register this document explicitly
+    clear_document_registry()
+    metrics = processed_doc["metrics"]
+    register_document(processed_doc["doc_id"], metrics["page_count"], metrics["word_count"])
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    answer = answer_question("How many pages?", [], processed_doc["doc_id"], api_key="fake-key-for-mock")
+
+    assert answer == "The document has 3 pages."
+    assert len(calls) == 2
+    assert calls[1][0].parts[0].text.startswith("Active Document ID")

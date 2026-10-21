@@ -1,12 +1,14 @@
 # Limitations, Security Considerations, and Future Improvements
 
+*Ask My PDF, developed by Team 2 (SDAIA Academy, Developing Generative AI Solutions workshop).*
+
 ## 1. Known limitations
 
 ### Retrieval
 - **Lexical retrieval only.** TF-IDF matches words, not meaning. Synonyms or paraphrases ("boss" vs. "lead") can score 0.0 even when the answer is present.
 - **Cross-lingual retrieval is a small keyword lexicon.** `translate_arabic_query_to_english` maps about ten Arabic keyword groups to English search terms. Several mapped term lists include vocabulary from the synthetic test PDF (e.g. "Dr Elena Rostova", "March 15 2025", "99.4%"). On other English PDFs these extra terms are just noise. Arabic questions outside the lexicon get 0.0 similarity and are refused even when the answer exists (shown by test T21). **The earlier Arabic-to-English failure is only partly fixed.**
 - **Arabic PDFs** are indexed with an English stop-word list and no Arabic normalization (e.g. alef/hamza variants), so Arabic-document retrieval quality is untested.
-- **Summary routing** is keyword-based; it returns the first chunk of up to 3 pages, so long documents are summarized only from their opening pages. The 0.95 score shown in the UI is assigned, not computed.
+- **Summary routing** is pattern-based; it samples the first chunk of up to 4 pages spread across the document, so most of a long document is not read for the summary (the offline answer adds a coverage note). The 0.95 score shown in the UI is assigned, not computed.
 - **Fixed parameters.** Chunk size (150 words), overlap (30), and top-k (3) are hard-coded and were not tuned on real documents.
 
 ### Extraction
@@ -23,7 +25,8 @@
 ### Offline simulation
 - The offline engine is a **rule-based test double**. Its fact templates (lead, launch date, SLA, chunk size, ISO 27001) only answer questions about the synthetic Project Aurora PDF. On other PDFs it returns the first sentence of the top chunk or a refusal.
 - Prompt-injection detection is a short keyword list; rephrased attacks are not detected in offline mode.
-- On any non-key, non-quota API error, the app **silently falls back** to the offline engine and appends a note. A user could miss that note and think the model answered.
+- On a timeout or any unclassified API error, the app falls back to the offline engine and appends a notice. A user could miss that notice and think the model answered.
+- API errors are classified by searching the error text for "401", "403", "404" or "429"; an unrelated message that contains one of these numbers could be misclassified.
 
 ### Tool
 - `get_document_stats` resolves **any unknown `doc_id` to the only registered document** when exactly one is registered. This is lenient on purpose but weaker than strict validation.
@@ -43,7 +46,7 @@
 | Prompt injection from the user | Same system instruction (live) and a keyword guard (offline). |
 | Grounding | System instruction requires answers only from excerpts with `[Page X]` citations and a fixed refusal sentence. Retrieved passages and scores are displayed so users can check the evidence. |
 | Tool safety | The only tool is read-only, takes one validated string, and returns two integers. No file system, shell, or network access is exposed to the model. |
-| Error handling | Invalid key and quota errors show clear messages; extraction errors are shown in the UI; 60 s request timeout. Unexpected exceptions show `str(err)` in the UI, which could reveal internal details. |
+| Error handling | 401/403/404/429 errors show clear messages; extraction errors are shown in the UI; 20 s request timeout; single tool round-trip with no loop. Unexpected exceptions show `str(err)` in the UI, which could reveal internal details. |
 | HTML rendering | `app.py` uses `unsafe_allow_html=True` and inserts the uploaded **filename** into HTML without escaping. Low risk for a local single-user app, but should be escaped before any shared deployment. |
 | Data privacy | Uploaded PDFs are processed in memory. In live mode, retrieved excerpts and the question are sent to Google's Gemini API. Do not upload confidential documents. |
 | Repository | Only the synthetic demo PDF is committed; `.gitignore` blocks other PDFs, `.env`, virtual environments, caches and logs. |
@@ -57,5 +60,5 @@
 5. **Visible mode indicator per answer:** label each answer as "Gemini" or "Offline simulation".
 6. **Escape user-controlled strings** before inserting them into HTML.
 7. **OCR** for scanned PDFs, and layout-aware extraction for tables and columns.
-8. **Better summaries:** sample chunks across the whole document rather than the first pages.
+8. **Better summaries:** use more than four sampled chunks (e.g. map-reduce summarization) for long documents.
 9. **Citation checking:** verify that every `[Page X]` in a live answer refers to a page among the retrieved chunks.

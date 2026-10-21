@@ -4,8 +4,9 @@ Uses scikit-learn's TfidfVectorizer and cosine_similarity to index chunks
 and retrieve the top K most relevant excerpts for a user query.
 
 Supports:
-- Multilingual retrieval (e.g. Arabic questions against English PDFs)
-- Dedicated document-summary path for high-level overview questions
+- Robust document-summary intent detection in English and Arabic
+- Multi-page representative chunk sampling for whole-document summaries
+- Multilingual cross-lingual retrieval for Arabic questions against English text
 - Strict rejection of zero-similarity chunks
 """
 
@@ -24,42 +25,50 @@ def is_arabic_text(text: str) -> bool:
 def is_summary_query(query: str) -> bool:
     """Detect if a query is asking for a general document summary or overview.
 
-    Handles both Arabic and English summary question patterns.
+    Handles English and Arabic variations including:
+    - "What's the PDF about?", "What's this PDF about?", "What is it about?"
+    - "Summarize this document", "Overview of the PDF", "What does this file discuss?"
+    - "عن إيش يتكلم؟", "عن ماذا يتحدث هذا الملف؟", "ملخص المستند", "ما هو موضوع هذا الملف؟"
     """
+    if not query or not query.strip():
+        return False
+
     q = query.lower().strip()
-    summary_indicators = [
-        # Arabic summary indicators
-        "عن إيش يتكلم",
-        "عن ايش يتكلم",
-        "عن ماذا يتحدث",
-        "عن ماذا يتكلم",
-        "عما يتحدث",
-        "عما يتكلم",
-        "ما موضوع",
-        "ما هو موضوع",
-        "موضوع المستند",
-        "محتوى المستند",
-        "ملخص",
-        "لخص",
-        "نبذة",
-        "فكرة عامة",
-        "نظرة عامة",
-        "أعطني ملخص",
-        # English summary indicators
-        "what is this about",
-        "what is it about",
-        "what does it talk about",
-        "what does this talk about",
-        "what is the document about",
-        "what is this document about",
-        "summarize",
-        "summary",
-        "overview",
-        "executive summary",
-        "general idea",
-        "main topic",
+    # Normalize common apostrophes and punctuation
+    norm_q = q.replace("’", "'").replace("?", "").replace("!", "").strip()
+
+    # English patterns
+    eng_patterns = [
+        r"what('?s| is) (the|this|it)? ?(pdf|document|file)? ?about",
+        r"what does (this|the) (pdf|document|file) (talk about|discuss|cover|say)",
+        r"\bsummar(y|ize|ise|izing)\b",
+        r"\boverview\b",
+        r"\bmain (topic|idea|points)\b",
+        r"\bgeneral (idea|overview)\b",
+        r"\bexecutive summary\b",
     ]
-    return any(indicator in q for indicator in summary_indicators)
+    for pat in eng_patterns:
+        if re.search(pat, norm_q):
+            return True
+
+    # Arabic patterns
+    ar_patterns = [
+        r"عن (إيش|ايش|ماذا|ما) (يتكلم|يتحدث|يدور)",
+        r"عما (يتحدث|يتكلم|يدور)",
+        r"ما (هو )?موضوع",
+        r"محتوى المستند",
+        r"ملخص",
+        r"لخص",
+        r"نبذ[ةه]",
+        r"فكر[ةه] عام[ةه]",
+        r"نظر[ةه] عام[ةه]",
+        r"أعطني ملخص",
+    ]
+    for pat in ar_patterns:
+        if re.search(pat, q):
+            return True
+
+    return False
 
 
 def translate_arabic_query_to_english(query: str) -> str:
@@ -74,18 +83,16 @@ def translate_arabic_query_to_english(query: str) -> str:
 
     # Check for summary intents
     if is_summary_query(q):
-        return "executive summary overview mission initiative project aurora introduction"
+        return "executive summary overview mission initiative introduction purpose abstract"
 
     # Lexicon mappings for common search intents and entities
     arabic_to_english_map = [
-        # Specific entities and queries
         (r"(يقود|قائد|مدير|رئيس|مسؤول|يدير|قياد[ةه])", "who leads project lead Dr Elena Rostova leadership"),
         (r"(إطلاق|اطلاق|تاريخ|موعد|بد[ءأ]|متى)", "launch date March 15 2025 official launch"),
         (r"(جاهزي[ةه]|تشغيل|sla|خدم[ةه]|أداء|latency|نسب[ةه])", "uptime SLA 99.4% processing latency milliseconds"),
         (r"(أجزاء|اجزاء|تقسيم|حجم|أطوال|طول)", "chunk size 150 words overlapping chunks"),
         (r"(أمان|امان|امتثال|معيار|معايير|حماي[ةه]|خصوصي[ةه]|iso)", "security compliance ISO 27001 data protection"),
         (r"(صفح[ةه]|صفحات|كلم[ةه]|كلمات|إحصائي[ةه]|احصائي[ةه]|إحصاء)", "page count word count document stats statistics"),
-        # Out-of-scope terms mapping (so they don't match English document)
         (r"(عاصم[ةه]|أستراليا|استراليا|كانبيرا)", "capital Australia Canberra"),
         (r"(سعر|آيفون|ايفون|هاتف)", "price iPhone 16 smartphone"),
         (r"(قصيد[ةه]|شعر|قطط)", "poem cats flowers"),
@@ -100,7 +107,6 @@ def translate_arabic_query_to_english(query: str) -> str:
     if translated_terms:
         return " ".join(translated_terms)
 
-    # Fallback: remove Arabic punctuation and return normalized query
     return q
 
 
@@ -137,11 +143,11 @@ class TFIDFRetriever:
             )
             self.tfidf_matrix = self.vectorizer.fit_transform(self.corpus)
 
-    def get_summary_chunks(self, max_chunks: int = 3) -> List[Dict[str, Union[str, int, float]]]:
+    def get_summary_chunks(self, max_chunks: int = 4) -> List[Dict[str, Union[str, int, float]]]:
         """Retrieve representative chunks from across the document for summary queries.
 
-        Selects the primary overview chunk (Page 1) and representative sections
-        from subsequent pages so the summary spans the whole document.
+        Evenly samples chunks across distinct pages (beginning, middle, end) so
+        the summary captures the document's structure and breadth.
         Assigns an explicit high relevance score (0.95) to ensure chunks are
         recognized as valid summary evidence, never zero-similarity noise.
 
@@ -154,33 +160,33 @@ class TFIDFRetriever:
         if not self.chunks:
             return []
 
-        # Gather the first chunk of distinct pages to ensure document-wide coverage
-        seen_pages = set()
-        representative_chunks: List[Dict[str, Union[str, int, float]]] = []
-
+        # Map each page number to its first chunk
+        page_to_chunk: Dict[int, Dict[str, Union[str, int]]] = {}
         for chunk in self.chunks:
-            page_num = chunk.get("page_number", 1)
-            if page_num not in seen_pages:
-                seen_pages.add(page_num)
-                summary_chunk = chunk.copy()
-                summary_chunk["score"] = 0.95
-                summary_chunk["retrieval_mode"] = "summary"
-                representative_chunks.append(summary_chunk)
-                if len(representative_chunks) >= max_chunks:
-                    break
+            p = int(chunk.get("page_number", 1))
+            if p not in page_to_chunk:
+                page_to_chunk[p] = chunk
 
-        # Fallback if there are fewer distinct pages than max_chunks
-        if len(representative_chunks) < max_chunks:
-            for chunk in self.chunks:
-                if chunk["chunk_id"] not in [c["chunk_id"] for c in representative_chunks]:
-                    summary_chunk = chunk.copy()
-                    summary_chunk["score"] = 0.90
-                    summary_chunk["retrieval_mode"] = "summary"
-                    representative_chunks.append(summary_chunk)
-                    if len(representative_chunks) >= max_chunks:
-                        break
+        sorted_pages = sorted(page_to_chunk.keys())
+        total_pages = len(sorted_pages)
 
-        return representative_chunks
+        if total_pages <= max_chunks:
+            selected_pages = sorted_pages
+        else:
+            # Evenly sample pages across the document (first, intermediate, last)
+            step = (total_pages - 1) / (max_chunks - 1)
+            selected_indices = [int(round(i * step)) for i in range(max_chunks)]
+            # Preserve order while removing duplicates
+            selected_pages = [sorted_pages[i] for i in dict.fromkeys(selected_indices)]
+
+        summary_chunks: List[Dict[str, Union[str, int, float]]] = []
+        for p in selected_pages:
+            sc = page_to_chunk[p].copy()
+            sc["score"] = 0.95
+            sc["retrieval_mode"] = "summary"
+            summary_chunks.append(sc)
+
+        return summary_chunks
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Union[str, int, float]]]:
         """Retrieve the top_k most similar chunks for a given query.
@@ -204,7 +210,9 @@ class TFIDFRetriever:
 
         # 1. Summary Path: Route overview / summary questions to representative chunks
         if is_summary_query(query):
-            return self.get_summary_chunks(max_chunks=top_k)
+            # For summaries, allow sampling up to 4 representative pages across the document
+            summary_limit = max(top_k, 4)
+            return self.get_summary_chunks(max_chunks=summary_limit)
 
         # 2. Multilingual Normalization: Translate Arabic queries to English keywords
         search_query = translate_arabic_query_to_english(query)

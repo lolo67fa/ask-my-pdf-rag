@@ -1,5 +1,7 @@
 # Architecture: Ask My PDF
 
+*Ask My PDF, developed by Team 2 (SDAIA Academy, Developing Generative AI Solutions workshop).*
+
 This document describes the architecture **as implemented in the current source code**. Where a component is simulated or tuned to the synthetic test document, that is stated explicitly.
 
 ## 1. Component overview
@@ -10,10 +12,10 @@ This document describes the architecture **as implemented in the current source 
 | PDF extraction | `pdf_processor.py` | PyMuPDF page-by-page text extraction, 1-based page numbers | No (plain extraction) |
 | Chunking | `pdf_processor.py` | Word-based sliding window (150 words, 30 overlap) per page | No |
 | Retrieval | `retriever.py` | scikit-learn TF-IDF (unigrams + bigrams, English stop words) + cosine similarity, top-k = 3 | No |
-| Summary routing | `retriever.py` | Keyword detection of "summary/overview" intent (Arabic + English); returns the first chunk of up to 3 distinct pages with a **fixed** score of 0.95 | No |
+| Summary routing | `retriever.py` | Keyword detection of "summary/overview" intent (Arabic + English); returns the first chunk of up to 4 pages sampled evenly across the document, with a **fixed** score of 0.95 | No |
 | Arabic query mapping | `retriever.py` | Regex lexicon that maps Arabic keywords to English search terms | No (rule-based, not a translator) |
 | Tool | `gemini_service.py` → `get_document_stats` | Returns page and word count of a registered document; validates input | No (deterministic Python) |
-| Live generation | `gemini_service.py` → `answer_question` | `google-genai` client, model `gemini-2.5-flash`, temperature 0, system instruction, tool declared, 60 s request timeout | **Yes**, only when a valid key is configured |
+| Live generation | `gemini_service.py` → `answer_question` | `google-genai` client, model `gemini-2.5-flash`, temperature 0, system instruction, tool declared (automatic function calling disabled), 20 s request timeout | **Yes**, only when a valid key is configured |
 | Offline generation | `gemini_service.py` → `_offline_grounded_answer` | Rule-based answer engine used for tests, with no key, or as fallback on API errors | No (simulation) |
 
 ## 2. Data flow
@@ -68,9 +70,9 @@ flowchart TD
 
 - Builds a prompt that labels excerpts as **untrusted reference material** and includes page, chunk id, retrieval mode, and similarity for each excerpt.
 - Sends it with `SYSTEM_INSTRUCTION` (grounding rules, `[Page X]` citation format, refusal sentences in English and Arabic, prompt-injection rules), `temperature=0.0`, and `tools=[get_document_stats]`.
-- Passing a Python callable as a tool enables the `google-genai` SDK's **automatic function calling**: the SDK can execute `get_document_stats` itself and return the final text. The code also has a manual branch that runs the function and sends a `function_response` back if `response.function_calls` is populated.
-- Errors: an invalid key or exhausted quota returns a clear warning message. **Any other exception falls back to the offline simulation** and appends a note saying so.
-- Each HTTP request has a 60-second timeout (`GEMINI_TIMEOUT_MS`), added in this review as a defensive measure against the earlier hang. Whether this was the actual root cause of the hang is **not confirmed**.
+- The SDK's **automatic function calling is disabled**. If the response contains a `get_document_stats` function call, the app runs the function once and sends the original prompt, the model's call, and a `function_response` in a single follow-up request **without tools**, so no tool loop is possible. This path is covered by test T28 with a mocked client.
+- Errors: 401, 403, 404 and 429 responses return a clear warning (detected by searching the error text). Timeouts and **any other exception fall back to the offline simulation** with a notice appended to the answer.
+- Each HTTP request has a 20-second timeout (`GEMINI_TIMEOUT_MS = 20000`; the SDK expects milliseconds). Whether this resolves the earlier hang is **not confirmed** by an independent live test.
 
 ### Offline simulation (used by all automated tests)
 
@@ -78,7 +80,7 @@ flowchart TD
 
 1. Keyword-based prompt-injection refusal (e.g. "ignore all", "jailbreak", "write a poem", Arabic equivalents).
 2. Keyword-based statistics intent → calls the real `get_document_stats` and formats the result.
-3. Summary intent → extractive overview: the first sentence of each summary chunk with its page number.
+3. Summary intent → extractive overview: the first substantive sentence of each sampled chunk with its page number, plus a *Coverage Note* when the document has more pages than were sampled.
 4. Refusal if no chunk scores above 0.05.
 5. Fact templates for the synthetic document (lead, launch date, SLA, chunk size, ISO 27001). A template only fires if the exact fact string is present in a retrieved chunk.
 6. Otherwise, the first sentence of the top chunk if its score is above 0.15; else refusal.

@@ -5,7 +5,9 @@ Implements:
 - Strict grounding instructions with mandatory [Page X] citations.
 - Strong prompt injection defenses treating document excerpts as untrusted reference data.
 - Multilingual grounded answering (answering in Arabic when queried in Arabic).
+- Dynamic, un-hardcoded document summarization from actual document text with coverage limitations.
 - Offline/mock fallback mode to allow running reproducible tests without API credentials.
+- Clear error handling distinguishing network timeouts from API errors (401, 403, 404, 429).
 """
 
 import os
@@ -13,11 +15,15 @@ import re
 from typing import List, Dict, Union, Optional
 from dotenv import load_dotenv
 
+from retriever import is_summary_query
+
 # Load environment variables from .env if present
 load_dotenv()
 
-# Per-request timeout for live Gemini calls, in milliseconds
-GEMINI_TIMEOUT_MS = 60_000
+# Per-request timeout for live Gemini calls in seconds and milliseconds.
+# Note: google-genai's HttpOptions.timeout expects milliseconds and divides by 1000 for httpx.
+GEMINI_TIMEOUT_SECONDS = 20.0
+GEMINI_TIMEOUT_MS = int(GEMINI_TIMEOUT_SECONDS * 1000)
 
 # Active document registry used by the real callable tool
 _DOCUMENT_REGISTRY: Dict[str, Dict[str, int]] = {}
@@ -72,7 +78,6 @@ def get_document_stats(doc_id: str) -> Dict[str, Union[str, int]]:
         raise ValueError("doc_id cannot be empty or whitespace.")
 
     if clean_id not in _DOCUMENT_REGISTRY:
-        # Fallback check: if there is only 1 document in registry, use it
         if len(_DOCUMENT_REGISTRY) == 1:
             clean_id = next(iter(_DOCUMENT_REGISTRY))
         else:
@@ -100,12 +105,13 @@ CRITICAL SECURITY RULES (PROMPT INJECTION DEFENSE):
 GROUNDING & CITATION RULES:
 1. Base your answer EXCLUSIVELY on the provided excerpts or function call results.
 2. Cite source page numbers explicitly in your answer using the format [Page X] for every fact (e.g., "The model achieved 99.4% uptime [Page 2].").
-3. MULTILINGUAL SUPPORT: If the user asks their question in Arabic (e.g. "عن إيش يتكلم؟") or another language, answer in that same language while strictly grounding your response in the provided document excerpts and preserving [Page X] citations.
-4. ZERO EVIDENCE REFUSAL: If all excerpts have 0.0000 similarity, or if the excerpts do not contain enough evidence to answer the question, or if the question asks for information not present in the document, you MUST explicitly refuse to answer and state:
+3. MULTILINGUAL SUPPORT: If the user asks in Arabic (e.g. "عن إيش يتكلم؟" or "ما هو موضوع هذا الملف؟") or another language, answer in that same language while strictly grounding your response in the provided document excerpts and preserving [Page X] citations.
+4. DOCUMENT SUMMARIES: If asked for an overview or summary of the PDF, synthesize the key points across the provided excerpts, citing each source page [Page X].
+5. ZERO EVIDENCE REFUSAL: If all excerpts have 0.0000 similarity, or if the excerpts do not contain enough evidence to answer the question, or if the question asks for information not present in the document, you MUST explicitly refuse to answer and state:
    - In English: "Based on the provided document, I cannot answer this question because the information is not present."
    - In Arabic: "بناءً على المستند المقدم، لا يمكنني الإجابة على هذا السؤال لأن المعلومات غير متوفرة في المستند."
-5. Never invent facts, make assumptions, or bring in outside knowledge.
-6. Keep answers concise, factual, and direct.
+6. Never invent facts, make assumptions, or bring in outside knowledge.
+7. Keep answers concise, factual, and direct.
 """
 
 
@@ -139,6 +145,56 @@ def _build_context_prompt(question: str, chunks: List[Dict[str, Union[str, int, 
     )
 
 
+def _build_dynamic_summary(chunks: List[Dict], is_ar: bool, doc_id: str) -> str:
+    """Construct an extractive grounded summary directly from actual chunks without hardcoding.
+
+    Extracts leading substantive sentences from each representative page chunk
+    and appends an explicit coverage note if the document has more pages than sampled.
+    """
+    total_pages = 0
+    if doc_id in _DOCUMENT_REGISTRY:
+        total_pages = _DOCUMENT_REGISTRY[doc_id]["page_count"]
+
+    summary_bullets = []
+    pages_cited = []
+
+    for c in chunks:
+        page_num = c.get("page_number", 1)
+        text = str(c.get("text", "")).strip()
+        if not text:
+            continue
+
+        # Extract the first substantive sentence from this chunk
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 15]
+        if sentences:
+            sentence = sentences[0]
+            if not sentence.endswith(('.', '!', '?')):
+                sentence += "."
+            summary_bullets.append(f"- {sentence} [Page {page_num}]")
+            pages_cited.append(page_num)
+
+    if not summary_bullets:
+        if is_ar:
+            return "بناءً على المستند المقدم، لا يمكنني استخراج ملخص لأن المستند لا يحتوي على نصوص كافية."
+        return "Based on the provided document, I cannot generate a summary because there is insufficient text."
+
+    unique_pages = sorted(set(pages_cited))
+    coverage_note = ""
+    if total_pages > len(unique_pages):
+        pages_str = ", ".join(str(p) for p in unique_pages)
+        if is_ar:
+            coverage_note = f"\n\n*(ملاحظة التغطية: يستند هذا الملخص إلى مقتطفات تمثيلية من الصفحات {pages_str} من إجمالي {total_pages} صفحات)*"
+        else:
+            coverage_note = f"\n\n*(Coverage Note: This summary is based on representative excerpts from Pages {pages_str} across the {total_pages}-page document)*"
+
+    if is_ar:
+        intro = "ملخص المستند استناداً إلى المحتوى المرفوع:"
+        return f"{intro}\n" + "\n".join(summary_bullets) + coverage_note
+    else:
+        intro = "Document Summary based on the uploaded content:"
+        return f"{intro}\n" + "\n".join(summary_bullets) + coverage_note
+
+
 def _offline_grounded_answer(
     question: str,
     chunks: List[Dict[str, Union[str, int, float]]],
@@ -147,6 +203,7 @@ def _offline_grounded_answer(
     """Deterministic offline answer generator for testing and offline environments.
 
     Runs 100% locally without API credentials, with full bilingual (English & Arabic) support.
+    Builds summaries dynamically from actual chunks without any hardcoded text.
     """
     q_lower = question.lower()
     is_ar = _is_arabic(question)
@@ -190,31 +247,11 @@ def _offline_grounded_answer(
         except Exception as err:
             return f"Error retrieving document statistics: {err}"
 
-    # 3. Document Summary Path Handling
-    summary_keywords = [
-        "عن إيش يتكلم", "عن ايش يتكلم", "عن ماذا يتحدث", "عن ماذا يتكلم", "عما يتحدث",
-        "ما موضوع", "ما هو موضوع", "ملخص", "لخص", "نبذة",
-        "what is this about", "what is it about", "summarize", "summary", "overview"
-    ]
-    is_summary = any(kw in q_lower for kw in summary_keywords)
-    if is_summary and chunks:
-        # Check if chunks contain valid summary coverage
+    # 3. Dynamic Document Summary Path Handling (No hardcoded text)
+    if is_summary_query(question) and chunks:
         has_summary_chunks = any(c.get("retrieval_mode") == "summary" or c.get("score", 0.0) > 0.5 for c in chunks)
         if has_summary_chunks:
-            # Extractive summary: first sentence of each representative chunk, cited by page.
-            # Built from the actual excerpts so it works for any uploaded PDF.
-            lines = []
-            for c in chunks:
-                sentences = [s.strip() for s in str(c.get("text", "")).split(".") if s.strip()]
-                if sentences:
-                    lines.append(f"- {sentences[0]} [Page {c.get('page_number', 1)}]")
-            if lines:
-                header = (
-                    "ملخص استخراجي من مقاطع المستند (النص بلغة المستند الأصلية):"
-                    if is_ar else
-                    "Extractive overview from the document excerpts:"
-                )
-                return header + "\n" + "\n".join(lines)
+            return _build_dynamic_summary(chunks, is_ar, doc_id)
 
     # 4. Zero-Evidence & Minimum Similarity Check
     # Do NOT treat zero-similarity chunks as relevant evidence!
@@ -224,59 +261,71 @@ def _offline_grounded_answer(
             return "بناءً على المستند المقدم، لا يمكنني الإجابة على هذا السؤال لأن المعلومات غير متوفرة في المستند."
         return "Based on the provided document, I cannot answer this question because the information is not present."
 
-    # 5. Factual Grounded Fact Extraction
+    # 5. Factual Grounded Fact Extraction from actual chunk text
     for c in chunks:
         c_text = str(c.get("text", ""))
         c_page = c.get("page_number", 1)
 
-        # Prompt injection in PDF text defense: do not execute instructions inside excerpts
+        # Defense against embedded instructions inside PDF
         if "PWNED_BY_INJECTION" in c_text and "PWNED_BY_INJECTION" in question:
             return "Based on the provided document, I cannot answer this question because the information is not present."
 
-        # Project Lead
+        # Project Lead lookup
         if any(term in q_lower for term in ["lead", "elena", "who leads", "project lead", "من يقود", "قائد", "مدير", "رئيس"]):
             if "Elena Rostova" in c_text:
                 if is_ar:
                     return f"يقود مشروع أورورا الدكتورة إيلينا روستوفا [Page {c_page}]."
                 return f"Project Aurora is led by Dr. Elena Rostova [Page {c_page}]."
 
-        # Launch Date
+        # Launch Date lookup
         if any(term in q_lower for term in ["launch date", "when was", "launch", "تاريخ الإطلاق", "موعد الإطلاق", "متى تم الإطلاق"]):
             if "March 15, 2025" in c_text:
                 if is_ar:
                     return f"تاريخ إطلاق مشروع أورورا هو 15 مارس 2025 [Page {c_page}]."
                 return f"The launch date is March 15, 2025 [Page {c_page}]."
 
-        # Uptime SLA
+        # Uptime SLA lookup
         if any(term in q_lower for term in ["uptime", "sla", "نسبة التشغيل", "جاهزية", "اتفاقية مستوى الخدمة"]):
             if "99.4%" in c_text:
                 if is_ar:
                     return f"تبلغ نسبة الجاهزية واتفاقية مستوى الخدمة للنظام 99.4% [Page {c_page}]."
                 return f"The system uptime SLA is 99.4% [Page {c_page}]."
 
-        # Chunk Size
+        # Chunk Size lookup
         if any(term in q_lower for term in ["chunk size", "chunks", "حجم الأجزاء", "تقسيم"]):
             if "150 words" in c_text or "150-word" in c_text:
                 if is_ar:
                     return f"يقسم النظام النصوص إلى أجزاء متداخلة بحجم 150 كلمة [Page {c_page}]."
                 return f"The system splits text into 150-word overlapping chunks [Page {c_page}]."
 
-        # Security Compliance
+        # Security Compliance lookup
         if any(term in q_lower for term in ["security", "iso", "compliance", "guideline", "أمان", "امتثال", "معايير الأمان"]):
             if "ISO 27001" in c_text:
                 if is_ar:
                     return f"يفرض المشروع التزامًا كاملاً ببروتوكولات الأمان وفق معيار ISO 27001 [Page {c_page}]."
                 return f"The document specifies compliance with ISO 27001 security standards [Page {c_page}]."
 
-    # Generic TF-IDF Grounded Answer (for other queries)
+        # General entity lookups from actual text (works dynamically for other documents)
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', c_text) if len(s.strip()) > 15]
+        for s in sentences:
+            # Check overlap between non-stop query words and sentence
+            q_words = [w for w in re.findall(r'\b\w{4,}\b', q_lower) if w not in {"what", "when", "where", "which", "about", "this", "that", "does"}]
+            if q_words and all(w in s.lower() for w in q_words[:2]):
+                if not s.endswith(('.', '!', '?')):
+                    s += "."
+                return f"{s} [Page {c_page}]"
+
+    # Generic highest-scoring chunk excerpt fallback
     top_chunk = chunks[0]
     top_score = top_chunk.get("score", 0.0)
     top_page = top_chunk.get("page_number", 1)
     top_text = str(top_chunk.get("text", "")).strip()
 
     if top_score > 0.15:
-        sentences = [s.strip() for s in top_text.split(".") if s.strip()]
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', top_text) if len(s.strip()) > 15]
         snippet = sentences[0] if sentences else top_text[:120]
+        if not snippet.endswith(('.', '!', '?')):
+            snippet += "."
         return f"{snippet} [Page {top_page}]."
 
     if is_ar:
@@ -294,7 +343,9 @@ def answer_question(
     """Generate an answer grounded strictly in the retrieved PDF chunks or tools.
 
     Uses genuine Gemini function calling when api_key is available;
-    falls back to offline grounded mode when offline=True or no key is present.
+    falls back to offline grounded mode when offline=True or on network timeout.
+
+    Distinguishes connection timeouts from API errors (401, 403, 404, 429).
 
     Args:
         question: User query (in English, Arabic, or any language).
@@ -311,51 +362,57 @@ def answer_question(
     if offline or not resolved_key or resolved_key == "your_gemini_api_key_here":
         return _offline_grounded_answer(question, chunks, doc_id)
 
-    # Attempt genuine Gemini API call via google-genai SDK
     try:
         from google import genai
         from google.genai import types
 
-        # Bound each HTTP request (milliseconds) so a stalled call cannot hang the UI indefinitely.
+        # Configure client with exact timeout in milliseconds (google-genai divides by 1000 for httpx)
         client = genai.Client(
             api_key=resolved_key,
             http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
         prompt_content = _build_context_prompt(question, chunks, doc_id)
 
+        # Disable SDK AFC loop to avoid direct AFC warning on generate_content and prevent infinite loops
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.0,
             tools=[get_document_stats],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt_content,
-            config=config
+            config=config,
         )
 
-        # Check if Gemini executed function calling or requested one
+        # Single-turn tool execution: execute tool and return follow-up without tools to avoid any loop
         if hasattr(response, "function_calls") and response.function_calls:
             for call in response.function_calls:
                 if call.name == "get_document_stats":
                     fn_args = dict(call.args) if call.args else {"doc_id": doc_id}
                     tool_output = get_document_stats(**fn_args)
 
-                    # Send tool result back to Gemini
                     follow_up = client.models.generate_content(
                         model="gemini-2.5-flash",
                         contents=[
-                            prompt_content,
+                            types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=prompt_content)]
+                            ),
                             response.candidates[0].content,
-                            types.Part.from_function_response(
-                                name="get_document_stats",
-                                response={"result": tool_output}
+                            types.Content(
+                                role="tool",
+                                parts=[types.Part.from_function_response(
+                                    name="get_document_stats",
+                                    response={"result": tool_output}
+                                )]
                             )
                         ],
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_INSTRUCTION,
-                            temperature=0.0
+                            temperature=0.0,
                         )
                     )
                     return follow_up.text.strip() if follow_up.text else "Document statistics retrieved."
@@ -369,10 +426,33 @@ def answer_question(
 
     except Exception as exc:
         err_msg = str(exc)
-        if "API_KEY_INVALID" in err_msg or "invalid api key" in err_msg.lower():
-            return "⚠️ Error: The configured Gemini API key is invalid. Please verify GEMINI_API_KEY in your .env file."
-        if "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-            return "⚠️ Error: Gemini API rate limit or quota exceeded. Please try again shortly."
+        err_type = type(exc).__name__
+
+        # Categorize API status errors without leaking credentials
+        if "401" in err_msg or "API_KEY_INVALID" in err_msg or "invalid api key" in err_msg.lower():
+            return "⚠️ Authentication Error (401): The configured Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY in your local .env file."
+
+        if "403" in err_msg or "PERMISSION_DENIED" in err_msg:
+            return "⚠️ Permission Error (403): Access to the Gemini model is forbidden for this API key or location."
+
+        if "404" in err_msg or "NOT_FOUND" in err_msg:
+            return "⚠️ Model Error (404): The requested Gemini model is not found or deprecated for this API version."
+
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+            return "⚠️ Quota Exceeded (429): Gemini API rate limit or quota exceeded. Please wait a moment before trying again."
+
+        # Handle network connect and read timeouts specifically
+        if "timeout" in err_msg.lower() or "connecttimeout" in err_type.lower() or "readtimeout" in err_type.lower():
+            fallback = _offline_grounded_answer(question, chunks, doc_id)
+            if _is_arabic(question):
+                return (
+                    f"{fallback}\n\n"
+                    f"*(تنبيه الشبكة: استغرقت استجابة خادم Gemini أكثر من {int(GEMINI_TIMEOUT_SECONDS)} ثانية؛ تم توليد الإجابة محلياً بالاعتماد التام على مقتطفات المستند المرفوع)*"
+                )
+            return (
+                f"{fallback}\n\n"
+                f"*(Network Notice: Gemini API connection timed out ({int(GEMINI_TIMEOUT_SECONDS)}s); answer generated using local grounded engine from your document)*"
+            )
 
         fallback = _offline_grounded_answer(question, chunks, doc_id)
-        return f"{fallback}\n\n*(Note: Generated via offline engine due to API connection issue)*"
+        return f"{fallback}\n\n*(Notice: Generated via local grounded engine due to API connection issue)*"
