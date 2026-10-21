@@ -66,11 +66,11 @@ flowchart TD
 
 ## 4. Live Gemini path vs. offline simulation
 
-### Live path (requires a valid key; **not verified in the current review**)
+### Live path (requires a valid key; verified with 9 live questions, see `test_results.md`)
 
 - Builds a prompt that labels excerpts as **untrusted reference material** and includes page, chunk id, retrieval mode, and similarity for each excerpt.
 - Sends it with `SYSTEM_INSTRUCTION` (grounding rules, `[Page X]` citation format, refusal sentences in English and Arabic, prompt-injection rules), `temperature=0.0`, and `tools=[get_document_stats]`.
-- The SDK's **automatic function calling is disabled**. If the response contains a `get_document_stats` function call, the app runs the function once and sends the original prompt, the model's call, and a `function_response` in a single follow-up request **without tools**, so no tool loop is possible. This path is covered by test T28 with a mocked client.
+- The SDK's **automatic function calling is disabled**. If the response contains a `get_document_stats` function call, the app runs the function once and sends the original prompt, the model's call, and a `function_response` in a single follow-up request **without tools**, so no tool loop is possible. This path is covered by mocked tests T28 and T30 and was verified live (L07 in `test_results.md`).
 - Errors: 401, 403, 404 and 429 responses return a clear warning (detected by searching the error text). Timeouts and **any other exception fall back to the offline simulation** with a notice appended to the answer.
 - Each HTTP request has a 20-second timeout (`GEMINI_TIMEOUT_MS = 20000`; the SDK expects milliseconds). Whether this resolves the earlier hang is **not confirmed** by an independent live test.
 
@@ -99,7 +99,9 @@ Validation:
 | :--- | :--- |
 | Not a string (e.g. `12345`, `None`) | `TypeError: doc_id must be a string, got <type>` |
 | Empty or whitespace-only string | `ValueError: doc_id cannot be empty or whitespace.` |
-| Unknown id, **one** document registered | Silently resolves to the registered document (lenient by design, so a model that slightly misnames the file still gets the stats) |
-| Unknown id, zero or several documents registered | `ValueError: Document '<id>' not found in registry...` |
+| Same name differing only in case, surrounding spaces, or a missing `.pdf` | Resolves to the registered document |
+| Any other name (even with exactly one document registered) | `ValueError: Document '<id>' not found in registry...` |
+
+In the live path, `TypeError`/`ValueError` from the tool are returned to Gemini as `{"status": "error", "error": ...}` in the function response, so the model can explain the problem instead of the request falling back to offline mode.
 
 The counts come from the actual extracted text, so they are exact for what PyMuPDF extracts; they may differ from a human count if the PDF contains hyphenation, tables, or non-selectable text.

@@ -55,6 +55,14 @@ def clear_document_registry() -> None:
     _DOCUMENT_REGISTRY.clear()
 
 
+def _normalize_doc_id(doc_id: str) -> str:
+    """Normalize a document name for tolerant matching (case, whitespace, '.pdf' suffix)."""
+    name = doc_id.strip().lower()
+    if name.endswith(".pdf"):
+        name = name[:-4]
+    return name.strip()
+
+
 def get_document_stats(doc_id: str) -> Dict[str, Union[str, int]]:
     """Get document statistics including total page count and total word count.
 
@@ -78,13 +86,17 @@ def get_document_stats(doc_id: str) -> Dict[str, Union[str, int]]:
         raise ValueError("doc_id cannot be empty or whitespace.")
 
     if clean_id not in _DOCUMENT_REGISTRY:
-        if len(_DOCUMENT_REGISTRY) == 1:
-            clean_id = next(iter(_DOCUMENT_REGISTRY))
-        else:
+        # Tolerate only formatting differences (case, missing ".pdf"); never substitute another document
+        matches = [
+            registered for registered in _DOCUMENT_REGISTRY
+            if _normalize_doc_id(registered) == _normalize_doc_id(clean_id)
+        ]
+        if len(matches) != 1:
             raise ValueError(
                 f"Document '{clean_id}' not found in registry. "
                 f"Available documents: {list(_DOCUMENT_REGISTRY.keys())}"
             )
+        clean_id = matches[0]
 
     stats = _DOCUMENT_REGISTRY[clean_id]
     return {
@@ -392,7 +404,11 @@ def answer_question(
             for call in response.function_calls:
                 if call.name == "get_document_stats":
                     fn_args = dict(call.args) if call.args else {"doc_id": doc_id}
-                    tool_output = get_document_stats(**fn_args)
+                    try:
+                        tool_output = get_document_stats(**fn_args)
+                    except (TypeError, ValueError) as tool_err:
+                        # Report invalid tool arguments back to the model instead of failing the request
+                        tool_output = {"status": "error", "error": str(tool_err)}
 
                     follow_up = client.models.generate_content(
                         model="gemini-2.5-flash",

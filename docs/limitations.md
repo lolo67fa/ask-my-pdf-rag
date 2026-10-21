@@ -17,7 +17,9 @@
 - Word counts are whitespace-based counts of the extracted text.
 
 ### Generation
-- **Live Gemini behavior was not verified in this review.** Grounding, citation format, refusals and injection resistance in live mode rely on the system instruction; none of this is tested automatically.
+- **Live Gemini was checked with 9 questions only** (8 completed). Grounding, citations, refusals and injection resistance rely on the system instruction and are not part of the automated tests.
+- **The zero-evidence refusal rule is not strictly followed by Gemini:** in live case L08 all retrieval scores were 0.0000 and Gemini still answered. Refusing in code when every score is 0 would enforce the rule.
+- **Free-tier limits:** live testing hit `429 RESOURCE_EXHAUSTED` after about 5 quick requests and `503 UNAVAILABLE` when the model was overloaded; there is no automatic retry.
 - No model output is guaranteed correct. Citations can be wrong or missing even when instructed; users should check the cited page.
 - The model name (`gemini-2.5-flash`) is hard-coded; model availability and pricing may change.
 - Only the current question is sent to the model; there is no conversation memory.
@@ -29,7 +31,7 @@
 - API errors are classified by searching the error text for "401", "403", "404" or "429"; an unrelated message that contains one of these numbers could be misclassified.
 
 ### Tool
-- `get_document_stats` resolves **any unknown `doc_id` to the only registered document** when exactly one is registered. This is lenient on purpose but weaker than strict validation.
+- `get_document_stats` tolerates case, whitespace, and a missing `.pdf` in the name. (Earlier versions returned the only loaded document's stats for *any* unknown name; fixed and covered by T29.)
 - The registry is a module-level dictionary. With several browser sessions on the same Streamlit server, one session's upload replaces the other's registry entry. Fine for a single local user; not suitable for multi-user deployment.
 
 ### Application
@@ -41,8 +43,8 @@
 | Topic | Current state |
 | :--- | :--- |
 | API key storage | Read from `.env` (gitignored) via `python-dotenv`. `.env.example` contains only a placeholder. The UI shows whether a key is present, never the key. |
-| Previously exposed key | A Gemini API key was earlier shown in the app interface. **Treat it as compromised: revoke it in Google AI Studio and create a new one** before any further live use or deployment. This repository does not contain that key (checked before commit). |
-| Prompt injection from PDF text | Excerpts are labeled "UNTRUSTED REFERENCE MATERIAL" in the prompt and the system instruction forbids following embedded instructions. This lowers risk but **does not eliminate it**; it is not verified against the live model. |
+| Previously exposed key | A Gemini API key was earlier shown in the app interface. The team **revoked it and replaced it** with a new key kept only in the local `.env`. Neither key is in this repository or its history (checked before each push). |
+| Prompt injection from PDF text | Excerpts are labeled "UNTRUSTED REFERENCE MATERIAL" in the prompt and the system instruction forbids following embedded instructions. This lowers risk but **does not eliminate it**; Gemini ignored the embedded instruction in one live test (L06). |
 | Prompt injection from the user | Same system instruction (live) and a keyword guard (offline). |
 | Grounding | System instruction requires answers only from excerpts with `[Page X]` citations and a fixed refusal sentence. Retrieved passages and scores are displayed so users can check the evidence. |
 | Tool safety | The only tool is read-only, takes one validated string, and returns two integers. No file system, shell, or network access is exposed to the model. |
@@ -55,7 +57,7 @@
 
 1. **Semantic or multilingual retrieval:** multilingual embeddings (or BM25 + embeddings hybrid) to replace the Arabic keyword lexicon.
 2. **Live evaluation set:** a small, opt-in pytest marker (e.g. `@pytest.mark.live`) that runs the 12 scenarios against Gemini when a key is present, recording results separately from offline tests.
-3. **Strict tool validation option:** reject unknown `doc_id`s instead of falling back.
+3. **Retry on temporary API errors:** retry once on 503 (model overloaded) before falling back to offline mode.
 4. **Per-session registry:** store document stats in `st.session_state` instead of a module-level dict.
 5. **Visible mode indicator per answer:** label each answer as "Gemini" or "Offline simulation".
 6. **Escape user-controlled strings** before inserting them into HTML.

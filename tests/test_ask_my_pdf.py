@@ -585,3 +585,53 @@ def test_28_live_tool_calling_path_with_mocked_client(processed_doc, monkeypatch
     assert answer == "The document has 3 pages."
     assert len(calls) == 2
     assert calls[1][0].parts[0].text.startswith("Active Document ID")
+
+
+def test_29_tool_rejects_wrong_document_name():
+    """Test 29: get_document_stats must never return another document's stats for a wrong name.
+
+    Formatting differences (case, whitespace, missing '.pdf') are tolerated;
+    a different document name raises ValueError even when only one document is loaded.
+    """
+    clear_document_registry()
+    register_document("Secret of Hegra.pdf", 1, 69)
+
+    for variant in ["Secret of Hegra.pdf", "secret of hegra", "  SECRET OF HEGRA.PDF  "]:
+        assert get_document_stats(variant)["doc_id"] == "Secret of Hegra.pdf"
+
+    with pytest.raises(ValueError) as exc_info:
+        get_document_stats("project_aurora.pdf")
+    assert "not found" in str(exc_info.value)
+
+
+def test_30_live_path_reports_tool_error_to_model(monkeypatch):
+    """Test 30: With a MOCKED Gemini client, a wrong doc_id from the model is returned to the
+    model as a tool error instead of crashing into the offline fallback."""
+    from google import genai
+    from google.genai import types
+
+    clear_document_registry()
+    register_document("report.pdf", 4, 500)
+    sent_tool_results = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            if not sent_tool_results and not isinstance(contents, list):
+                fc = types.FunctionCall(name="get_document_stats", args={"doc_id": "other_file.pdf"})
+                return types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(role="model", parts=[types.Part(function_call=fc)]))])
+            result = contents[2].parts[0].function_response.response["result"]
+            sent_tool_results.append(result)
+            return types.GenerateContentResponse(candidates=[types.Candidate(
+                content=types.Content(role="model", parts=[types.Part.from_text(text="Tool error reported.")]))])
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.models = FakeModels()
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    answer = answer_question("How many pages?", [], "report.pdf", api_key="fake-key-for-mock")
+
+    assert answer == "Tool error reported."
+    assert sent_tool_results[0]["status"] == "error"
+    assert "not found" in sent_tool_results[0]["error"]

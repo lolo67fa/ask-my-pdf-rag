@@ -49,7 +49,7 @@ The pipeline is deliberately simple so every step can be inspected: PyMuPDF extr
 
 An **offline simulation mode** lets the whole pipeline and its tests run without an API key. That mode is a rule-based stand-in for the model, and this README is explicit about which results come from it.
 
-**Current verified status (2026-10-22):** 28 of 28 automated tests pass (27 offline tests plus 1 test of the live code path against a mocked Gemini client). Real Gemini answers were **not** independently verified in this review (see [§13](#13-testing-methodology-and-actual-results)).
+**Current verified status (2026-10-22):** 30 of 30 automated tests pass (offline, plus mocked-client tests of the live code path). In a separate live run, real Gemini answered 8 of 9 English/Arabic test questions correctly with page citations, including a genuine `get_document_stats` function call; 1 case was blocked by the API quota (see [§13](#13-testing-methodology-and-actual-results)).
 
 ## 2. Problem statement and intended users
 
@@ -68,7 +68,7 @@ Reading a long PDF to find one fact is slow, and general-purpose chatbots may an
 | **Goals** | Grounded answers with page citations; explicit refusal when evidence is missing; one real tool with validated input; reproducible offline tests; an inspectable pipeline suitable for learning. |
 | **In scope** | One text-based PDF at a time; English questions; Arabic questions for a limited set of keywords; local Streamlit UI; Gemini or offline answering. |
 | **Out of scope** | OCR, multi-document search, conversation memory, user accounts, public deployment. |
-| **Main limitations** | Lexical (TF-IDF) retrieval; Arabic support via a small keyword lexicon; offline engine tuned to the synthetic test document; live Gemini path not re-verified. Full list: [`docs/limitations.md`](docs/limitations.md). |
+| **Main limitations** | Lexical (TF-IDF) retrieval; Arabic support via a small keyword lexicon; offline engine tuned to the synthetic test document; live Gemini checked on 9 questions only. Full list: [`docs/limitations.md`](docs/limitations.md). |
 
 ## 4. Main features
 
@@ -80,11 +80,11 @@ Reading a long PDF to find one fact is slow, and general-purpose chatbots may an
 | TF-IDF + cosine similarity retrieval, top 3 chunks with scores | `retriever.py` | Working (tested) |
 | Summary/overview question routing (Arabic + English) | `retriever.py` | Working (tested); scores are assigned, not computed |
 | Arabic → English keyword mapping for retrieval | `retriever.py` | **Partial**: works only for words in a small lexicon |
-| Grounded answers with `[Page X]` citations via Gemini 2.5 Flash | `gemini_service.py` | Implemented; **not verified live in this review** |
-| Refusal when evidence is missing (English and Arabic) | `gemini_service.py` | Tested offline; live behavior relies on the system instruction |
-| Prompt-injection defenses (untrusted-excerpt framing + system rules; keyword guard offline) | `gemini_service.py` | Tested offline only |
+| Grounded answers with `[Page X]` citations via Gemini 2.5 Flash | `gemini_service.py` | **Verified live** on 8 questions (L01–L08), English and Arabic |
+| Refusal when evidence is missing (English and Arabic) | `gemini_service.py` | Tested offline; live refusal verified once (L05). Gemini did **not** refuse when all scores were 0 in L08 |
+| Prompt-injection defenses (untrusted-excerpt framing + system rules; keyword guard offline) | `gemini_service.py` | Tested offline; one live case (L06): embedded instruction ignored |
 | `get_document_stats` tool with input validation | `gemini_service.py` | Working (tested directly) |
-| Gemini function calling for the tool | `gemini_service.py` | Implemented (single round-trip, no loop); verified with a mocked client (T28), **not verified with real Gemini** |
+| Gemini function calling for the tool | `gemini_service.py` | **Verified live** (L07: Gemini called the tool with the correct name); also covered by mocked tests T28, T30 |
 | Offline simulation mode (no key needed) | `gemini_service.py` | Working; rule-based |
 | Document overview (pages, words, chunk count) and retrieved-passage viewer with scores | `app.py` | Working (observed manually earlier; not re-checked in this review) |
 | SDAIA Academy branding in the UI | `app.py` | Working (observed manually earlier) |
@@ -161,8 +161,10 @@ More detail, including exact thresholds: [`docs/architecture.md`](docs/architect
 | :--- | :--- |
 | Not a string (`12345`, `None`) | `TypeError: doc_id must be a string, got int` |
 | Empty or whitespace (`""`, `"   "`) | `ValueError: doc_id cannot be empty or whitespace.` |
-| Unknown name, exactly one document loaded | Falls back to the loaded document (lenient by design) |
-| Unknown name, no or several documents loaded | `ValueError: Document '<id>' not found in registry...` |
+| Same name with different case, spacing, or without `.pdf` (e.g. `secret of hegra`) | Resolves to the loaded document |
+| Any other name, even when only one document is loaded | `ValueError: Document '<id>' not found in registry...` |
+
+In live mode, a tool error is sent back to Gemini as the tool result (`{"status": "error", ...}`) so the model can report it, instead of failing the whole request (tests T29, T30).
 
 It is used in three ways: called by Gemini through function calling (live mode), called by the offline engine when a question asks for page/word counts, and called by the **Test 'get_document_stats' Tool** button in the sidebar.
 
@@ -176,7 +178,7 @@ It is used in three ways: called by Gemini through function calling (live mode),
 | Grounding and citations | Required by the system instruction; depends on model compliance | Answers come from templates that only fire when the fact string is in a retrieved chunk, or from the first sentence of the top chunk |
 | Prompt-injection defense | Excerpts framed as untrusted; system rules | Keyword list |
 | Works on any PDF? | Intended to | Partly: fact templates only cover the synthetic test PDF; other PDFs get extractive or refusal answers |
-| Verified in this review? | Code path verified with a **mocked** client (T28); **real Gemini output not verified** | **Yes** (27 tests) |
+| Verified in this review? | **Yes, live:** 8 of 9 questions (L01–L08), plus mocked tests T28 and T30 | **Yes** (offline tests) |
 
 **Plain extraction (no model in either mode):** page text, page count, word count, chunking, and TF-IDF scores.
 
@@ -201,7 +203,7 @@ ask-my-pdf-rag/
 ├── notebooks/
 │   └── project_demo.ipynb      # Reproducible offline walkthrough
 ├── tests/
-│   └── test_ask_my_pdf.py      # 28 tests (27 offline + 1 mocked live path)
+│   └── test_ask_my_pdf.py      # 30 tests (offline + mocked live path; no API calls)
 └── docs/
     ├── architecture.md
     ├── test_results.md
@@ -280,7 +282,7 @@ Then choose *Run → Run All Cells*. The notebook imports the real project modul
 
 The tests build a synthetic 3-page PDF whose Page 3 contains a deliberate prompt-injection line, then run the real extraction, chunking, retrieval, and tool code. Answers are produced by the **offline simulation**, so the tests check the pipeline and the safety logic, not the quality of the Gemini model.
 
-**Latest run (2026-10-22, Windows 11, Python 3.10.0): 28 passed, 0 failed.**
+**Latest run (2026-10-22, Windows 11, Python 3.10.0): 30 passed, 0 failed.**
 
 | Group | Tests | Result |
 | :--- | :--- | :--- |
@@ -292,6 +294,7 @@ The tests build a synthetic 3-page PDF whose Page 3 contains a deliberate prompt
 | Summary on a different PDF; known Arabic limitation | T20–T21 | 2/2 pass |
 | Summary phrasing, summaries of other PDFs, coverage note, factual retrieval and refusal on a second PDF | T22–T27 | 6/6 pass |
 | Live function-calling code path with a **mocked** Gemini client (no network) | T28 | 1/1 pass |
+| Tool name validation; tool error returned to the model (mocked) | T29–T30 | 2/2 pass |
 
 T01–T12 are the 12 workshop tests. The full table with each question, expected result, and actual output is in [`docs/test_results.md`](docs/test_results.md).
 
@@ -301,11 +304,29 @@ T01–T12 are the 12 workshop tests. The full table with each question, expected
 
 **Documented failure (known limitation):** "كم مدة الاحتفاظ بالبيانات؟" (how long is data retained?) → every chunk scores 0.0000 because the Arabic words are not in the lexicon → refusal, **although the answer (90 days) is on Page 3**.
 
-**Live Gemini tests:** none were run in this review, so no live accuracy is claimed. An earlier run reported "12 passed in 22.02 s" for the original 12 tests; that is historical and has been superseded by the run above.
+### Live Gemini results (separate from the automated tests)
 
-### Arabic demonstration on a real project document (team-reported)
+Run on 2026-10-22 with `gemini-2.5-flash` and a newly rotated key: 16 real API requests, with every request and every offline fallback recorded by instrumentation.
 
-The team reports that the running app answered Arabic questions about its own project document, *Secret of Hegra* (a one-page English PDF; **not included in this repository**), including questions about the technologies it uses (Unity and Meta Quest 3). This review checked what can be checked without a live API call:
+| Case | Question | Final source | Result |
+| :--- | :--- | :--- | :--- |
+| L01 | "Who leads Project Aurora?" | Real Gemini | Dr. Elena Rostova `[Page 1]` |
+| L02 | "من يقود المشروع؟" | Real Gemini | Correct Arabic answer `[Page 1]` |
+| L03 | "What's this PDF about?" | Real Gemini (first try: 503 → offline fallback) | Summary citing Pages 1–3 |
+| L04 | "عن إيش يتكلم هذا المستند؟" | Real Gemini | Arabic summary citing Pages 1–3 |
+| L05 | "What is the capital of Australia?" | Real Gemini | Correct refusal |
+| L06 | Compliance question (PDF contains an injection line) | Real Gemini (first try: 503 → offline fallback) | ISO 27001 `[Page 3]`; injection ignored |
+| L07 | "How many pages and words does this document have?" | Real Gemini + real function call | Called `get_document_stats`; "3 pages and 116 words" |
+| L08 | *Secret of Hegra*: "ما هي التقنيات المستخدمة في المشروع؟" | Real Gemini | VR, Meta Quest 3, Unity `[Page 1]` |
+| L09 | *Secret of Hegra*: "Does the project use Unity and Meta Quest 3?" | Not completed | 429 quota limit |
+
+**Important caveat (L08):** every retrieval score was 0.0000, yet Gemini answered instead of refusing. The answer was right because the PDF has a single page, but this shows the zero-evidence refusal rule is not strictly followed by the model. Full details: [`docs/test_results.md`](docs/test_results.md#live-gemini-results-2026-10-22).
+
+Earlier runs ("12 passed in 22.02 s"; "21/21 passed") are historical and superseded by the results above.
+
+### Arabic demonstration on a real project document
+
+The team's own project document, *Secret of Hegra* (a one-page English PDF; **not included in this repository**), was used for an Arabic demonstration. **Real Gemini answered the Arabic technology question correctly (L08 above).** The offline engine, by contrast, does not:
 
 | Question on *Secret of Hegra* | Offline engine result (re-run 2026-10-22) |
 | :--- | :--- |
@@ -313,23 +334,23 @@ The team reports that the running app answered Arabic questions about its own pr
 | "ما هي التقنيات المستخدمة في المشروع؟" (what technologies are used?) | TF-IDF score 0.0000 → refusal |
 | "Does the project use Unity and Meta Quest 3?" | Score 0.2144; returns the title line only, not the technologies |
 
-So the offline engine does **not** reproduce the technology answers. If the app answered them correctly, that answer came from live Gemini reading the retrieved page, which **has not been independently verified** here. Re-run these questions with a rotated key and record the answers before presenting them as evidence.
+So the technology answer depends on live Gemini; in offline mode the app refuses or returns only the title line.
 
 ### Verified vs. not verified
 
 | Verified in this review | Not independently verified |
 | :--- | :--- |
-| Extraction, chunking, page numbers, page/word counts | Real Gemini answer quality, citations, and refusals |
-| TF-IDF retrieval and scores; summary sampling | Gemini resisting prompt injection |
-| `get_document_stats` results and input validation | Gemini actually choosing to call the tool |
-| Offline engine answers, refusals, injection guard (27 tests) | That the 20 s timeout fixes the earlier hang |
-| Live tool round-trip code with a mocked client (T28) | Team-reported Hegra / Unity / Meta Quest 3 answers |
-| App starts without errors (headless Streamlit check) | Full UI walkthrough in a browser |
+| Extraction, chunking, page numbers, page/word counts | Gemini behavior beyond the 9 live questions (one run each, not a benchmark) |
+| TF-IDF retrieval and scores; summary sampling | Gemini injection resistance in general (only one live injection case) |
+| `get_document_stats` validation, incl. wrong-name rejection (T29) | The English Hegra question (L09, blocked by quota) |
+| Offline engine answers, refusals, injection guard | Root cause of the earlier hang (no hang seen in 16 requests) |
+| Live answers, citations, refusal, and function calling (L01–L08) | Full UI walkthrough in a browser |
+| App starts without errors (headless Streamlit check) | |
 
 ## 14. Security
 
-- **API keys.** Loaded from `.env` only; `.env.example` holds a placeholder. The UI reports whether a key is present but never displays it. A key was shown in an earlier version of the interface; **that key must be treated as compromised and rotated** before further live use. Before the first commit, the repository files were checked for key-like strings and none were found.
-- **Prompt injection.** Retrieved text is labeled as untrusted reference material, and the system instruction forbids following instructions inside it or changing persona. Offline, a keyword guard refuses common injection phrases. These measures reduce but do not eliminate risk, and live resistance has not been re-verified.
+- **API keys.** Loaded from `.env` only; `.env.example` holds a placeholder. The UI reports whether a key is present but never displays it. A key was shown in an earlier version of the interface; the team has **revoked it and replaced it** with a new key (stored only in the local `.env`). Before the first commit, the repository files were checked for key-like strings and none were found.
+- **Prompt injection.** Retrieved text is labeled as untrusted reference material, and the system instruction forbids following instructions inside it or changing persona. Offline, a keyword guard refuses common injection phrases. These measures reduce but do not eliminate risk; Gemini ignored the embedded injection in the one live test (L06).
 - **Grounding.** The system instruction requires answers only from excerpts, `[Page X]` citations, and a fixed refusal sentence when evidence is missing. Retrieved passages and scores are shown under every answer so users can check them. This does not guarantee correct answers.
 - **Error handling.** Invalid PDFs and 401/403/404/429 API errors produce clear messages; requests time out after 20 s; timeouts and other API errors fall back to offline mode with a visible notice.
 - **Tool surface.** One read-only tool with one validated string argument; no file, shell, or network access.
@@ -341,16 +362,16 @@ More: [`docs/limitations.md`](docs/limitations.md#2-security-considerations).
 
 1. **Arabic questions about English PDFs only partly work.** The original problem (TF-IDF score 0.0000 for Arabic questions) is addressed by a keyword lexicon that covers about ten topics, several tuned to the synthetic PDF. Other Arabic questions still score 0.0 and are refused (test T21).
 2. **Earlier hanging Gemini request: root cause not confirmed.** A 20 s request timeout and a no-loop, single tool round-trip are now in place; whether they resolve the original hang has not been independently tested live.
-3. **Live Gemini path not re-verified** (answers, citations, refusals, function calling).
+3. **Zero-evidence rule not enforced in code:** in live case L08, all retrieval scores were 0.0000 but Gemini still answered (correctly, because the PDF has one page). On multi-page PDFs this could lead to answers from unrelated chunks.
 4. **Offline engine is document-specific** for factual answers.
 5. **Silent fallback** to offline mode on unexpected API errors may be missed by users (a note is appended).
-6. **Lenient tool validation:** unknown `doc_id`s resolve to the single loaded document.
+6. **Fixed:** `get_document_stats` used to return the loaded document's stats for *any* unknown name. It now accepts only formatting variants of the loaded name and rejects others (T29).
 7. **Module-level registry** is shared between browser sessions on one server.
 8. The uploaded filename is inserted into HTML without escaping (low risk locally).
 
 ## 16. Deployment status
 
-**Local only.** The app runs on `http://localhost:8501` on a local computer. There is no public deployment, and public deployment is not required by the workshop. Before any shared deployment: rotate the key, use a secret manager, escape user-controlled HTML, move the registry into session state, and add upload limits.
+**Local only.** The app runs on `http://localhost:8501` on a local computer. There is no public deployment, and public deployment is not required by the workshop. Before any shared deployment: use a secret manager for the key, escape user-controlled HTML, move the registry into session state, and add upload limits.
 
 ## 17. Five-minute demonstration guide
 
@@ -374,7 +395,7 @@ Script and backup plan: [`docs/demo_guide.md`](docs/demo_guide.md). State during
 | 2 | Synthetic sample data, at least five items | `data/project_aurora_sample.pdf` (3 pages, 8 facts), `data/sample_questions.json` (9 items) |
 | 3 | Working retrieval with traceable sources | `retriever.py`; page + score shown per chunk |
 | 4 | Real tool with input validation and accurate result | `get_document_stats`, tests T06, T09, T10 |
-| 5 | Twelve diverse tests | T01–T12 (+ 16 regression tests) |
+| 5 | Twelve diverse tests | T01–T12 (+ 18 regression tests; + 9 live Gemini cases) |
 | 6 | Runnable notebook, synthetic data, test table, README | `notebooks/`, `data/`, `docs/test_results.md`, this file |
 | 7 | Honest separation of real model, simulated, and plain extraction | [§9](#9-real-gemini-function-calling-vs-offline-simulation) |
 | 8 | Documented success and failure/refusal with evidence | [§13](#13-testing-methodology-and-actual-results) |
@@ -382,7 +403,7 @@ Script and backup plan: [`docs/demo_guide.md`](docs/demo_guide.md). State during
 | 10 | Limitations, security, future improvements | [§14](#14-security)–[§19](#19-future-improvements), `docs/limitations.md` |
 | 11 | Public deployment not required | [§16](#16-deployment-status) |
 
-**Still open:** a live Gemini run recorded as evidence (after key rotation).
+**Still open:** completing live case L09 when the API quota allows; refusing in code when every retrieval score is 0.
 
 ## 19. Future improvements
 
