@@ -16,6 +16,21 @@
 
 > **Educational project disclaimer.** This repository is a student learning project created for a training workshop. It is **not** an official SDAIA or SDAIA Academy product, and it is not endorsed, reviewed, or maintained by SDAIA or SDAIA Academy. The SDAIA Academy name and logo are used only to acknowledge the educational context of the workshop. The software is provided as-is, without warranty; it can produce incorrect answers and must not be used for decisions that matter without checking the cited source pages.
 
+## Team Members
+
+This project was developed by **Team 2** as part of the **تطوير حلول الذكاء الاصطناعي التوليدي** (*Developing Generative AI Solutions*) program at **SDAIA Academy**.
+
+Official academy website: [SDAIA Academy](https://sdaia.gov.sa/ar/Sectors/BuildingCapacity/academy/Pages/default.aspx)
+
+| # | Name |
+| :-: | :--- |
+| 1 | Ghala Ahmad Alshreef |
+| 2 | Aljaze alqahtani |
+| 3 | Raghad alzkeri |
+| 4 | Ghaida Alanazi |
+| 5 | Melan Alhuzaimi |
+| 6 | Reema aljarbou |
+
 ---
 
 ## Table of contents
