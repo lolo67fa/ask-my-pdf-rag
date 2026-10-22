@@ -131,7 +131,7 @@ Model `gemini-2.5-flash` with the team's newly rotated key. A small harness wrap
 
 ### Code changes after the live run
 
-The live run used commit `0aaf008`. Later the same day, three changes affected what Gemini receives:
+The live run used commit `1b2dcfa` ("Fix get_document_stats name matching and record live Gemini results"). Later the same day, three changes affected what Gemini receives:
 
 1. **Zero-evidence guard:** zero-score excerpts are no longer sent (except summary and `full_document` chunks). L06 now sends only its matching Page 3.
 2. **`full_document` label:** for PDFs no longer than three chunks, zero-score retrieval sends the whole document labeled as such (L05, L07, L08).
