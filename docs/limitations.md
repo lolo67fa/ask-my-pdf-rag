@@ -6,7 +6,7 @@
 
 ### Retrieval
 - **Lexical retrieval only.** TF-IDF matches words, not meaning. Synonyms or paraphrases ("boss" vs. "lead") can score 0.0 even when the answer is present.
-- **Cross-lingual retrieval is a small keyword lexicon.** `translate_arabic_query_to_english` maps about ten Arabic keyword groups to English search terms. Several mapped term lists include vocabulary from the synthetic test PDF (e.g. "Dr Elena Rostova", "March 15 2025", "99.4%"). On other English PDFs these extra terms are just noise. Arabic questions outside the lexicon get 0.0 similarity and are refused even when the answer exists (shown by test T21). **The earlier Arabic-to-English failure is only partly fixed.**
+- **Cross-lingual retrieval is a small keyword lexicon.** `translate_arabic_query_to_english` maps about 14 Arabic keyword groups to English search terms (4 of them generic: technologies, goals, cost, risks). Several mapped term lists include vocabulary from the synthetic test PDF (e.g. "Dr Elena Rostova", "March 15 2025", "99.4%"). On other English PDFs these extra terms are just noise. Arabic questions outside the lexicon get 0.0 similarity. On short PDFs (up to three chunks) the whole document is then sent to Gemini (`full_document`), which can still answer; on longer PDFs nothing is sent and the question is refused, even when the answer exists (offline: test T21). **The earlier Arabic-to-English failure is only partly fixed.**
 - **Arabic PDFs** are indexed with an English stop-word list and no Arabic normalization (e.g. alef/hamza variants), so Arabic-document retrieval quality is untested.
 - **Summary routing** is pattern-based; it samples the first chunk of up to 4 pages spread across the document, so most of a long document is not read for the summary (the offline answer adds a coverage note). The 0.95 score shown in the UI is assigned, not computed.
 - **Fixed parameters.** Chunk size (150 words), overlap (30), and top-k (3) are hard-coded and were not tuned on real documents.
@@ -17,8 +17,8 @@
 - Word counts are whitespace-based counts of the extracted text.
 
 ### Generation
-- **Live Gemini was checked with 9 questions only** (8 completed). Grounding, citations, refusals and injection resistance rely on the system instruction and are not part of the automated tests.
-- **The zero-evidence refusal rule is not strictly followed by Gemini:** in live case L08 all retrieval scores were 0.0000 and Gemini still answered. Refusing in code when every score is 0 would enforce the rule.
+- **Live Gemini was checked with 9 questions only** (8 completed), and before the latest prompt changes. Grounding, citations, refusals and injection resistance rely on the system instruction and are not part of the automated tests.
+- **Zero-evidence handling relies partly on the model:** in live case L08 all retrieval scores were 0.0000 and Gemini still answered. The code now drops zero-score excerpts before calling Gemini (T32), except for short PDFs where the whole document is sent (`full_document`); in that case the model decides whether the document answers the question.
 - **Free-tier limits:** live testing hit `429 RESOURCE_EXHAUSTED` after about 5 quick requests and `503 UNAVAILABLE` when the model was overloaded; there is no automatic retry.
 - No model output is guaranteed correct. Citations can be wrong or missing even when instructed; users should check the cited page.
 - The model name (`gemini-2.5-flash`) is hard-coded; model availability and pricing may change.
@@ -32,11 +32,11 @@
 
 ### Tool
 - `get_document_stats` tolerates case, whitespace, and a missing `.pdf` in the name. (Earlier versions returned the only loaded document's stats for *any* unknown name; fixed and covered by T29.)
-- The registry is a module-level dictionary. With several browser sessions on the same Streamlit server, one session's upload replaces the other's registry entry. Fine for a single local user; not suitable for multi-user deployment.
+- The registry is a module-level dictionary shared by all sessions on one server. The app re-registers the current session's document before each answer and before the tool button, which keeps single-user and light use correct; truly simultaneous users could still briefly overlap.
 
 ### Application
 - One PDF at a time; chat resets on a new upload. Re-uploading a file with the same name is not reprocessed.
-- No upload size limit beyond Streamlit's default.
+- Uploads are limited to 25 MB (`.streamlit/config.toml`).
 
 ## 2. Security considerations
 
@@ -49,7 +49,7 @@
 | Grounding | System instruction requires answers only from excerpts with `[Page X]` citations and a fixed refusal sentence. Retrieved passages and scores are displayed so users can check the evidence. |
 | Tool safety | The only tool is read-only, takes one validated string, and returns two integers. No file system, shell, or network access is exposed to the model. |
 | Error handling | 401/403/404/429 errors show clear messages; extraction errors are shown in the UI; 20 s request timeout; single tool round-trip with no loop. Unexpected exceptions show `str(err)` in the UI, which could reveal internal details. |
-| HTML rendering | `app.py` uses `unsafe_allow_html=True` and inserts the uploaded **filename** into HTML without escaping. Low risk for a local single-user app, but should be escaped before any shared deployment. |
+| HTML rendering | `app.py` uses `unsafe_allow_html=True` for styling; the only user-controlled value inserted into HTML (the uploaded filename) is escaped with `html.escape`. |
 | Data privacy | Uploaded PDFs are processed in memory. In live mode, retrieved excerpts and the question are sent to Google's Gemini API. Do not upload confidential documents. |
 | Repository | Only the synthetic demo PDF is committed; `.gitignore` blocks other PDFs, `.env`, virtual environments, caches and logs. |
 
@@ -59,8 +59,6 @@
 2. **Live evaluation set:** a small, opt-in pytest marker (e.g. `@pytest.mark.live`) that runs the 12 scenarios against Gemini when a key is present, recording results separately from offline tests.
 3. **Retry on temporary API errors:** retry once on 503 (model overloaded) before falling back to offline mode.
 4. **Per-session registry:** store document stats in `st.session_state` instead of a module-level dict.
-5. **Visible mode indicator per answer:** label each answer as "Gemini" or "Offline simulation".
-6. **Escape user-controlled strings** before inserting them into HTML.
-7. **OCR** for scanned PDFs, and layout-aware extraction for tables and columns.
-8. **Better summaries:** use more than four sampled chunks (e.g. map-reduce summarization) for long documents.
-9. **Citation checking:** verify that every `[Page X]` in a live answer refers to a page among the retrieved chunks.
+5. **OCR** for scanned PDFs, and layout-aware extraction for tables and columns.
+6. **Better summaries:** use more than four sampled chunks (e.g. map-reduce summarization) for long documents.
+7. **Citation checking:** verify that every `[Page X]` in a live answer refers to a page among the retrieved chunks.

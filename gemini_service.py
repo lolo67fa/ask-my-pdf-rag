@@ -12,7 +12,7 @@ Implements:
 
 import os
 import re
-from typing import List, Dict, Union, Optional
+from typing import List, Dict, Union, Optional, Tuple
 from dotenv import load_dotenv
 
 from retriever import is_summary_query
@@ -24,6 +24,16 @@ load_dotenv()
 # Note: google-genai's HttpOptions.timeout expects milliseconds and divides by 1000 for httpx.
 GEMINI_TIMEOUT_SECONDS = 20.0
 GEMINI_TIMEOUT_MS = int(GEMINI_TIMEOUT_SECONDS * 1000)
+
+# Questions longer than this are rejected before any API call (execution limit)
+MAX_QUESTION_CHARS = 2000
+
+# Where an answer came from (shown in the UI)
+SOURCE_GEMINI = "gemini"
+SOURCE_OFFLINE = "offline"
+SOURCE_FALLBACK = "offline_fallback"
+SOURCE_API_ERROR = "api_error"
+SOURCE_REJECTED = "rejected"
 
 # Active document registry used by the real callable tool
 _DOCUMENT_REGISTRY: Dict[str, Dict[str, int]] = {}
@@ -119,9 +129,10 @@ GROUNDING & CITATION RULES:
 2. Cite source page numbers explicitly in your answer using the format [Page X] for every fact (e.g., "The model achieved 99.4% uptime [Page 2].").
 3. MULTILINGUAL SUPPORT: If the user asks in Arabic (e.g. "عن إيش يتكلم؟" or "ما هو موضوع هذا الملف؟") or another language, answer in that same language while strictly grounding your response in the provided document excerpts and preserving [Page X] citations.
 4. DOCUMENT SUMMARIES: If asked for an overview or summary of the PDF, synthesize the key points across the provided excerpts, citing each source page [Page X].
-5. ZERO EVIDENCE REFUSAL: If all excerpts have 0.0000 similarity, or if the excerpts do not contain enough evidence to answer the question, or if the question asks for information not present in the document, you MUST explicitly refuse to answer and state:
+5. ZERO EVIDENCE REFUSAL: If no excerpts are provided, or if the excerpts do not contain enough evidence to answer the question, or if the question asks for information not present in the document, you MUST explicitly refuse to answer and state:
    - In English: "Based on the provided document, I cannot answer this question because the information is not present."
    - In Arabic: "بناءً على المستند المقدم، لا يمكنني الإجابة على هذا السؤال لأن المعلومات غير متوفرة في المستند."
+   Excerpts marked "Mode full_document" contain the ENTIRE (short) document even though keyword similarity is 0; answer from them only if they actually contain the answer.
 6. Never invent facts, make assumptions, or bring in outside knowledge.
 7. Keep answers concise, factual, and direct.
 """
@@ -345,19 +356,34 @@ def _offline_grounded_answer(
     return "Based on the provided document, I cannot answer this question because the information is not present."
 
 
-def answer_question(
+def _usable_evidence(chunks: List[Dict[str, Union[str, int, float]]]) -> List[Dict[str, Union[str, int, float]]]:
+    """Drop zero-similarity chunks so the model cannot answer from unrelated text.
+
+    Summary chunks and 'full_document' chunks (the whole of a small PDF) are kept.
+    """
+    if any(c.get("retrieval_mode") in ("summary", "full_document") for c in chunks):
+        return chunks
+    return [c for c in chunks if float(c.get("score", 0.0)) > 0.0]
+
+
+def _refusal(question: str) -> str:
+    if _is_arabic(question):
+        return "بناءً على المستند المقدم، لا يمكنني الإجابة على هذا السؤال لأن المعلومات غير متوفرة في المستند."
+    return "Based on the provided document, I cannot answer this question because the information is not present."
+
+
+def answer_question_with_source(
     question: str,
     chunks: List[Dict[str, Union[str, int, float]]],
     doc_id: str,
     api_key: Optional[str] = None,
     offline: bool = False
-) -> str:
-    """Generate an answer grounded strictly in the retrieved PDF chunks or tools.
+) -> Tuple[str, str]:
+    """Generate a grounded answer and report where it came from.
 
-    Uses genuine Gemini function calling when api_key is available;
-    falls back to offline grounded mode when offline=True or on network timeout.
-
-    Distinguishes connection timeouts from API errors (401, 403, 404, 429).
+    Uses genuine Gemini function calling when an API key is available;
+    falls back to the offline grounded engine when offline=True, no key is set,
+    or the API times out or fails.
 
     Args:
         question: User query (in English, Arabic, or any language).
@@ -367,12 +393,18 @@ def answer_question(
         offline: If True, forces deterministic local mode for testing.
 
     Returns:
-        A grounded answer string with [Page X] citations or clear refusal.
+        (answer, source) where source is one of SOURCE_GEMINI, SOURCE_OFFLINE,
+        SOURCE_FALLBACK, SOURCE_API_ERROR, or SOURCE_REJECTED.
     """
+    if len(question) > MAX_QUESTION_CHARS:
+        if _is_arabic(question):
+            return (f"السؤال طويل جداً. الحد الأقصى هو {MAX_QUESTION_CHARS} حرف.", SOURCE_REJECTED)
+        return (f"The question is too long. The maximum is {MAX_QUESTION_CHARS} characters.", SOURCE_REJECTED)
+
     resolved_key = api_key or os.getenv("GEMINI_API_KEY", "").strip()
 
     if offline or not resolved_key or resolved_key == "your_gemini_api_key_here":
-        return _offline_grounded_answer(question, chunks, doc_id)
+        return _offline_grounded_answer(question, chunks, doc_id), SOURCE_OFFLINE
 
     try:
         from google import genai
@@ -383,7 +415,7 @@ def answer_question(
             api_key=resolved_key,
             http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
-        prompt_content = _build_context_prompt(question, chunks, doc_id)
+        prompt_content = _build_context_prompt(question, _usable_evidence(chunks), doc_id)
 
         # Disable SDK AFC loop to avoid direct AFC warning on generate_content and prevent infinite loops
         config = types.GenerateContentConfig(
@@ -431,31 +463,33 @@ def answer_question(
                             temperature=0.0,
                         )
                     )
-                    return follow_up.text.strip() if follow_up.text else "Document statistics retrieved."
+                    answer = follow_up.text.strip() if follow_up.text else "Document statistics retrieved."
+                    return answer, SOURCE_GEMINI
 
         if response.text:
-            return response.text.strip()
+            return response.text.strip(), SOURCE_GEMINI
 
-        if _is_arabic(question):
-            return "بناءً على المستند المقدم، لا يمكنني الإجابة على هذا السؤال لأن المعلومات غير متوفرة في المستند."
-        return "Based on the provided document, I cannot answer this question because the information is not present."
+        return _refusal(question), SOURCE_GEMINI
 
     except Exception as exc:
         err_msg = str(exc)
         err_type = type(exc).__name__
+        # google-genai APIError exposes the HTTP status as .code; fall back to text matching
+        code = getattr(exc, "code", None)
 
         # Categorize API status errors without leaking credentials
-        if "401" in err_msg or "API_KEY_INVALID" in err_msg or "invalid api key" in err_msg.lower():
-            return "⚠️ Authentication Error (401): The configured Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY in your local .env file."
+        if code == 401 or "API_KEY_INVALID" in err_msg or "invalid api key" in err_msg.lower():
+            return ("⚠️ Authentication Error (401): The configured Gemini API key is invalid or unauthorized. "
+                    "Please verify GEMINI_API_KEY in your local .env file or Streamlit secrets."), SOURCE_API_ERROR
 
-        if "403" in err_msg or "PERMISSION_DENIED" in err_msg:
-            return "⚠️ Permission Error (403): Access to the Gemini model is forbidden for this API key or location."
+        if code == 403 or "PERMISSION_DENIED" in err_msg:
+            return "⚠️ Permission Error (403): Access to the Gemini model is forbidden for this API key or location.", SOURCE_API_ERROR
 
-        if "404" in err_msg or "NOT_FOUND" in err_msg:
-            return "⚠️ Model Error (404): The requested Gemini model is not found or deprecated for this API version."
+        if code == 404 or "NOT_FOUND" in err_msg:
+            return "⚠️ Model Error (404): The requested Gemini model is not found or deprecated for this API version.", SOURCE_API_ERROR
 
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-            return "⚠️ Quota Exceeded (429): Gemini API rate limit or quota exceeded. Please wait a moment before trying again."
+        if code == 429 or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+            return "⚠️ Quota Exceeded (429): Gemini API rate limit or quota exceeded. Please wait a moment before trying again.", SOURCE_API_ERROR
 
         # Handle network connect and read timeouts specifically
         if "timeout" in err_msg.lower() or "connecttimeout" in err_type.lower() or "readtimeout" in err_type.lower():
@@ -464,11 +498,26 @@ def answer_question(
                 return (
                     f"{fallback}\n\n"
                     f"*(تنبيه الشبكة: استغرقت استجابة خادم Gemini أكثر من {int(GEMINI_TIMEOUT_SECONDS)} ثانية؛ تم توليد الإجابة محلياً بالاعتماد التام على مقتطفات المستند المرفوع)*"
-                )
+                ), SOURCE_FALLBACK
             return (
                 f"{fallback}\n\n"
                 f"*(Network Notice: Gemini API connection timed out ({int(GEMINI_TIMEOUT_SECONDS)}s); answer generated using local grounded engine from your document)*"
-            )
+            ), SOURCE_FALLBACK
 
+        # Other failures (e.g. 503 model overloaded): answer locally and say so
         fallback = _offline_grounded_answer(question, chunks, doc_id)
-        return f"{fallback}\n\n*(Notice: Generated via local grounded engine due to API connection issue)*"
+        return f"{fallback}\n\n*(Notice: Generated via local grounded engine due to API connection issue)*", SOURCE_FALLBACK
+
+
+def answer_question(
+    question: str,
+    chunks: List[Dict[str, Union[str, int, float]]],
+    doc_id: str,
+    api_key: Optional[str] = None,
+    offline: bool = False
+) -> str:
+    """Generate an answer grounded in the retrieved PDF chunks or tools (answer text only).
+
+    See answer_question_with_source for details and for the answer's origin.
+    """
+    return answer_question_with_source(question, chunks, doc_id, api_key=api_key, offline=offline)[0]

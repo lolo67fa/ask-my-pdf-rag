@@ -32,6 +32,12 @@ from gemini_service import (
     clear_document_registry,
     get_document_stats,
     answer_question,
+    answer_question_with_source,
+    SOURCE_GEMINI,
+    SOURCE_OFFLINE,
+    SOURCE_FALLBACK,
+    SOURCE_API_ERROR,
+    SOURCE_REJECTED,
 )
 
 
@@ -635,3 +641,110 @@ def test_30_live_path_reports_tool_error_to_model(monkeypatch):
     assert answer == "Tool error reported."
     assert sent_tool_results[0]["status"] == "error"
     assert "not found" in sent_tool_results[0]["error"]
+
+
+# ============================================================================
+# ZERO-EVIDENCE HANDLING, EXECUTION LIMITS, AND ANSWER-SOURCE LABELS
+# ============================================================================
+
+def _make_retriever(tmp_path, name, page_texts):
+    pdf_path = str(tmp_path / name)
+    doc = fitz.open()
+    for text in page_texts:
+        doc.new_page().insert_text((50, 72), text)
+    doc.save(pdf_path)
+    doc.close()
+    return TFIDFRetriever(chunk_pages(extract_pages_from_pdf(pdf_path)))
+
+
+class _RecordingClient:
+    """Mocked Gemini client: records prompts and returns fixed text (or raises)."""
+
+    prompts = []
+    error = None
+
+    def __init__(self, **kwargs):
+        self.models = self
+
+    def generate_content(self, model, contents, config):
+        from google.genai import types
+        if _RecordingClient.error is not None:
+            raise _RecordingClient.error
+        _RecordingClient.prompts.append(contents)
+        return types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(role="model", parts=[types.Part.from_text(text="mock answer")]))])
+
+
+@pytest.fixture
+def recording_client(monkeypatch):
+    from google import genai
+    _RecordingClient.prompts = []
+    _RecordingClient.error = None
+    monkeypatch.setattr(genai, "Client", _RecordingClient)
+    return _RecordingClient
+
+
+def test_31_small_pdf_zero_score_is_marked_full_document(tmp_path):
+    """Test 31: With zero similarity, chunks are labeled 'full_document' only when they are the whole PDF."""
+    small = _make_retriever(tmp_path, "one_page.pdf", ["Lantern Trail Guide.\nVisitors walk the trail at night."])
+    assert all(c["retrieval_mode"] == "full_document" for c in small.retrieve("What is the refund policy?", top_k=3))
+
+    large = _make_retriever(tmp_path, "five_pages.pdf", [f"Section {i} covers topic number {i}." for i in range(1, 6)])
+    results = large.retrieve("What is the refund policy?", top_k=3)
+    assert all(c["score"] == 0.0 and c["retrieval_mode"] == "tfidf" for c in results)
+
+
+def test_32_live_path_sends_no_unrelated_excerpts(tmp_path, recording_client):
+    """Test 32 (mocked Gemini): when every score is 0 on a multi-chunk PDF, no excerpts reach the model."""
+    large = _make_retriever(tmp_path, "five_pages.pdf", [f"Section {i} covers topic number {i}." for i in range(1, 6)])
+    chunks = large.retrieve("What is the refund policy?", top_k=3)
+
+    answer, source = answer_question_with_source("What is the refund policy?", chunks, "five_pages.pdf", api_key="fake-key-for-mock")
+
+    prompt = recording_client.prompts[0]
+    assert "(No matching document excerpts found)" in prompt
+    assert "Section" not in prompt
+    assert source == SOURCE_GEMINI and answer == "mock answer"
+
+
+def test_33_overlong_question_rejected_without_api_call(recording_client, processed_doc):
+    """Test 33 (execution limit): questions over MAX_QUESTION_CHARS are rejected before any API call."""
+    question = "Who leads Project Aurora? " * 200
+    answer, source = answer_question_with_source(question, [], processed_doc["doc_id"], api_key="fake-key-for-mock")
+
+    assert source == SOURCE_REJECTED
+    assert "too long" in answer
+    assert recording_client.prompts == []
+
+
+def test_34_answer_source_labels(processed_doc, recording_client):
+    """Test 34 (mocked Gemini): offline, fallback-after-503, and 429 error are labeled distinctly."""
+    from google.genai import errors
+
+    query = "Who leads Project Aurora?"
+    chunks = processed_doc["retriever"].retrieve(query, top_k=3)
+
+    _, source = answer_question_with_source(query, chunks, processed_doc["doc_id"], offline=True)
+    assert source == SOURCE_OFFLINE
+
+    recording_client.error = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
+    answer, source = answer_question_with_source(query, chunks, processed_doc["doc_id"], api_key="fake-key-for-mock")
+    assert source == SOURCE_FALLBACK
+    assert "Elena Rostova" in answer and "local grounded engine" in answer
+
+    recording_client.error = errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
+    answer, source = answer_question_with_source(query, chunks, processed_doc["doc_id"], api_key="fake-key-for-mock")
+    assert source == SOURCE_API_ERROR
+    assert "429" in answer
+
+
+def test_35_arabic_technology_question_retrieves_english_text(tmp_path):
+    """Test 35: generic Arabic lexicon entry ('technologies') matches English technology text."""
+    retriever = _make_retriever(tmp_path, "stack.pdf", [
+        "Project Overview.\nThe team designed a museum guide for visitors.",
+        "Technologies.\nThe software platform uses a game engine and cloud tools.",
+        "Schedule.\nTesting happens in the second semester.",
+    ])
+    results = retriever.retrieve("ما هي التقنيات المستخدمة في المشروع؟", top_k=3)
+    assert results[0]["page_number"] == 2
+    assert results[0]["score"] > 0.05

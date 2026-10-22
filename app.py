@@ -10,6 +10,7 @@ A clean, beginner-friendly interface with purple accents that:
 
 import os
 import base64
+import html
 from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
@@ -20,11 +21,53 @@ from gemini_service import (
     register_document,
     clear_document_registry,
     get_document_stats,
-    answer_question,
+    answer_question_with_source,
+    SOURCE_GEMINI,
+    SOURCE_OFFLINE,
+    SOURCE_FALLBACK,
+    SOURCE_API_ERROR,
 )
 
 # Load environment variables
 load_dotenv()
+
+SOURCE_LABELS = {
+    SOURCE_GEMINI: "🤖 Answered by Gemini 2.5 Flash",
+    SOURCE_OFFLINE: "💻 Answered by the local offline engine (Gemini not configured)",
+    SOURCE_FALLBACK: "💻 Answered by the local offline engine (Gemini was unavailable)",
+    SOURCE_API_ERROR: "⚠️ Gemini API error (no answer generated)",
+}
+
+MODE_LABELS = {
+    "summary": "Summary Path",
+    "full_document": "Full Document (small PDF)",
+    "tfidf": "TF-IDF",
+}
+
+
+def resolve_gemini_key() -> str:
+    """Read GEMINI_API_KEY from the environment/.env, then Streamlit secrets. Never displayed."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        except Exception:
+            # No secrets.toml configured (normal for local runs)
+            key = ""
+    return key
+
+
+def render_chunks(chunks):
+    """Show retrieved passages with page, chunk id, retrieval mode, and score."""
+    with st.expander("🔍 View Retrieved Document Chunks"):
+        for c in chunks:
+            mode_label = MODE_LABELS.get(c.get("retrieval_mode", "tfidf"), "TF-IDF")
+            st.markdown(
+                f"**Page {c.get('page_number', '?')}** | Chunk `{c.get('chunk_id', '')}` | "
+                f"Mode: `{mode_label}` | Score: `{c.get('score', 0.0):.4f}`\n\n"
+                f"> {c.get('text', '')}"
+            )
+            st.divider()
 
 # Page configuration
 st.set_page_config(
@@ -124,8 +167,8 @@ with st.sidebar:
 
     # Connection Status
     st.subheader("🤖 AI Connection")
-    env_key = os.getenv("GEMINI_API_KEY", "").strip()
-    is_gemini_configured = bool(env_key and env_key != "your_gemini_api_key_here")
+    gemini_key = resolve_gemini_key()
+    is_gemini_configured = bool(gemini_key and gemini_key != "your_gemini_api_key_here")
 
     if is_gemini_configured:
         st.success("Gemini API key detected (connection is checked on first question)")
@@ -196,6 +239,12 @@ with st.sidebar:
 
         # Test tool button
         if st.button("🔧 Test 'get_document_stats' Tool"):
+            clear_document_registry()
+            register_document(
+                st.session_state.doc_id,
+                st.session_state.doc_metrics["page_count"],
+                st.session_state.doc_metrics["word_count"],
+            )
             stats = get_document_stats(st.session_state.doc_id)
             st.json(stats)
 
@@ -264,7 +313,7 @@ else:
     <div style="display: flex; align-items: center; justify-content: space-between; background-color: #F5F3FF; border: 1px solid #DDD6FE; border-radius: 8px; padding: 10px 16px; margin-bottom: 20px;">
         <div>
             <span style="font-weight: 700; color: #5B21B6;">📄 Active Document:</span>
-            <span style="color: #4C1D95; margin-left: 6px;">{st.session_state.doc_id}</span>
+            <span style="color: #4C1D95; margin-left: 6px;">{html.escape(st.session_state.doc_id)}</span>
         </div>
         <div>
             <span class="citation-badge">{st.session_state.doc_metrics['page_count']} Pages</span>
@@ -282,20 +331,12 @@ else:
         with st.chat_message(role):
             st.markdown(content)
 
+            if role == "assistant" and msg.get("source"):
+                st.caption(SOURCE_LABELS.get(msg["source"], ""))
+
             # If there are retrieved chunks associated with this assistant message, display them in an expander
             if role == "assistant" and chunks:
-                with st.expander("🔍 View Retrieved Document Chunks (Top 3)"):
-                    for c in chunks:
-                        score = c.get("score", 0.0)
-                        page = c.get("page_number", "?")
-                        cid = c.get("chunk_id", "")
-                        mode = c.get("retrieval_mode", "tfidf")
-                        mode_label = "Summary Path" if mode == "summary" else "TF-IDF"
-                        st.markdown(
-                            f"**Page {page}** | Chunk `{cid}` | Mode: `{mode_label}` | Score: `{score:.4f}`\n\n"
-                            f"> {c.get('text', '')}"
-                        )
-                        st.divider()
+                render_chunks(chunks)
 
     # Chat input box
     prompt = st.chat_input("Ask a question about the document...")
@@ -308,33 +349,33 @@ else:
         # Retrieve top 3 chunks using TF-IDF
         top_chunks = st.session_state.retriever.retrieve(prompt, top_k=3)
 
+        # The tool registry is shared by the server process; make sure it holds this session's document
+        clear_document_registry()
+        register_document(
+            st.session_state.doc_id,
+            st.session_state.doc_metrics["page_count"],
+            st.session_state.doc_metrics["word_count"],
+        )
+
         # Generate answer with Gemini or offline mode
         with st.chat_message("assistant"):
             with st.spinner("Finding relevant passages & generating grounded answer..."):
-                answer = answer_question(
+                answer, source = answer_question_with_source(
                     question=prompt,
                     chunks=top_chunks,
-                    doc_id=st.session_state.doc_id
+                    doc_id=st.session_state.doc_id,
+                    api_key=gemini_key or None,
                 )
                 st.markdown(answer)
+                st.caption(SOURCE_LABELS.get(source, ""))
 
                 if top_chunks:
-                    with st.expander("🔍 View Retrieved Document Chunks (Top 3)"):
-                        for c in top_chunks:
-                            score = c.get("score", 0.0)
-                            page = c.get("page_number", "?")
-                            cid = c.get("chunk_id", "")
-                            mode = c.get("retrieval_mode", "tfidf")
-                            mode_label = "Summary Path" if mode == "summary" else "TF-IDF"
-                            st.markdown(
-                                f"**Page {page}** | Chunk `{cid}` | Mode: `{mode_label}` | Score: `{score:.4f}`\n\n"
-                                f"> {c.get('text', '')}"
-                            )
-                            st.divider()
+                    render_chunks(top_chunks)
 
         # Save assistant message to session state
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
-            "chunks": top_chunks
+            "chunks": top_chunks,
+            "source": source,
         })

@@ -97,6 +97,11 @@ def translate_arabic_query_to_english(query: str) -> str:
         (r"(سعر|آيفون|ايفون|هاتف)", "price iPhone 16 smartphone"),
         (r"(قصيد[ةه]|شعر|قطط)", "poem cats flowers"),
         (r"(تجاهل|تجاوز|أوامر|أمر)", "ignore previous instructions system override jailbreak"),
+        # Generic intents (no document-specific terms)
+        (r"(تقني[ةه]|تقنيات|تكنولوجيا|أدوات|ادوات|برمجيات|منص[ةه])", "technology technologies tools software platform framework engine"),
+        (r"(هدف|أهداف|اهداف|غاي[ةه])", "goal goals objective objectives aim purpose mission"),
+        (r"(تكلف[ةه]|ميزاني[ةه])", "cost costs budget"),
+        (r"(مخاطر|خطر)", "risk risks"),
     ]
 
     translated_terms = []
@@ -225,11 +230,17 @@ class TFIDFRetriever:
         ranked_indices = np.argsort(similarities)[::-1]
         top_indices = ranked_indices[:top_k]
 
+        # With zero similarity everywhere, the chunks only count as evidence when they
+        # are the entire document (small PDFs); the answer layer uses this label.
+        mode = "tfidf"
+        if not similarities.any() and len(self.chunks) <= top_k:
+            mode = "full_document"
+
         results: List[Dict[str, Union[str, int, float]]] = []
         for idx in top_indices:
             chunk = self.chunks[idx].copy()
             chunk["score"] = float(round(similarities[idx], 4))
-            chunk["retrieval_mode"] = "tfidf"
+            chunk["retrieval_mode"] = mode
             results.append(chunk)
 
         return results

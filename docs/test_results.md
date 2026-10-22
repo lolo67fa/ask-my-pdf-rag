@@ -5,13 +5,13 @@
 **Execution date:** 2026-10-22
 **Command:** `python -m pytest tests/test_ask_my_pdf.py -v`
 **Environment:** Windows 11, Python 3.10.0, project `venv` (pytest 9.1.1, pymupdf 1.28.2, scikit-learn 1.7.2, google-genai 2.32.0)
-**Offline/mocked result:** **30 passed, 0 failed** (about 3–6 s)
+**Offline/mocked result:** **35 passed, 0 failed** (about 4–6 s)
 **Live Gemini result:** 8 of 9 live cases answered by real Gemini; 1 blocked by quota (see [Live Gemini results](#live-gemini-results-2026-10-22))
 
 ## What these tests do and do not cover
 
 - **T01–T27 run offline** (`offline=True`). They exercise real PDF extraction, chunking, TF-IDF retrieval, summary sampling, and the real `get_document_stats` tool. Answers come from the **offline simulation** (a rule-based engine), **not** from Gemini.
-- **T28 and T30 run the live Gemini code path against a mocked client.** No network or key is used. They check that a tool request is executed (or its error reported) and sent back in a well-formed follow-up. They do **not** check what the real model would say.
+- **T28, T30, T32, T33 and T34 run the live Gemini code path against a mocked client.** No network or key is used. They check tool round-trips, tool errors, which excerpts are sent, the question length limit, and how API errors are labeled. They do **not** check what the real model would say.
 - **Real Gemini was tested separately** with 9 live questions (L01–L09), reported in their own section below and kept apart from the automated results.
 - Test data is synthetic: a 3-page "Project Aurora" PDF (same content as `data/generate_sample_pdf.py`, with a deliberate prompt-injection line on Page 3), a 3-page "Deep Sea Research" PDF, a 1-page "Community Garden" PDF, and a 7-page report, all generated at test time.
 
@@ -28,7 +28,8 @@
 | Summary phrasing, other PDFs, coverage note, factual and out-of-scope on a second PDF | T22–T27 | 6/6 pass |
 | Live tool-calling path (mocked client) | T28 | 1/1 pass |
 | Tool name validation; tool error returned to model (mocked) | T29, T30 | 2/2 pass |
-| **Total** | | **30/30 pass** |
+| Zero-evidence guard, question length limit, answer-source labels, Arabic technology retrieval | T31–T35 | 5/5 pass |
+| **Total** | | **35/35 pass** |
 
 ## Core workshop test set (12 tests)
 
@@ -49,7 +50,7 @@
 
 Distribution: 6 answerable, 2 out of scope, 2 invalid tool arguments, 2 prompt injection, which matches the workshop requirement.
 
-## Additional regression tests (18 tests)
+## Additional regression tests (23 tests)
 
 | ID | Category | Scenario | Expected result | Actual result | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -71,6 +72,11 @@ Distribution: 6 answerable, 2 out of scope, 2 invalid tool arguments, 2 prompt i
 | T28 | Live code path (mocked) | "How many pages?" with a fake Gemini client that requests `get_document_stats` | Tool runs; result returned in a follow-up; final text returned | Two requests made; follow-up carried the prompt and tool result; answer "The document has 3 pages." | PASS |
 | T29 | Tool name validation | Registered "Secret of Hegra.pdf"; ask for variants and for "project_aurora.pdf" | Variants resolve; other name → `ValueError` | "secret of hegra" and "  SECRET OF HEGRA.PDF  " resolve; "project_aurora.pdf" raises "not found" | PASS |
 | T30 | Tool error in live path (mocked) | Fake model requests stats for "other_file.pdf" | Error sent to the model as the tool result; no offline fallback | Function response `{"status": "error", "error": "Document 'other_file.pdf' not found…"}`; final answer from the (fake) model | PASS |
+| T31 | Zero-score labeling | Unrelated question on a 1-page PDF and on a 5-page PDF | 1-page: chunks labeled `full_document`; 5-page: plain `tfidf` with score 0 | As expected | PASS |
+| T32 | Zero-evidence guard (mocked) | Unrelated question on a 5-page PDF, live path | No excerpts in the prompt sent to the model | Prompt contains "(No matching document excerpts found)" and no page text | PASS |
+| T33 | Execution limit (mocked) | 5,200-character question | Rejected before any API call | "The question is too long…"; source `rejected`; 0 requests | PASS |
+| T34 | Answer-source labels (mocked) | Offline mode; mocked 503; mocked 429 | `offline`; `offline_fallback` with notice; `api_error` | All three as expected; the 503 answer still names Dr. Elena Rostova | PASS |
+| T35 | Arabic technology question | "ما هي التقنيات المستخدمة في المشروع؟" on a 3-page PDF with a Technologies page | Top chunk Page 2, score > 0.05 | Top chunk Page 2 | PASS |
 
 ## How to read these results honestly
 
@@ -123,6 +129,16 @@ Model `gemini-2.5-flash` with the team's newly rotated key. A small harness wrap
 5. **Arabic on English PDFs works better with Gemini than offline:** Gemini read the English excerpts and answered in Arabic (L02, L04, L08), but only when retrieval delivered the right chunk. Retrieval itself is still lexical.
 6. **Temporary API errors:** 503s fall back to the offline engine with a visible notice; there is no automatic retry.
 
+### Code changes after the live run
+
+The live run used commit `0aaf008`. Later the same day, three changes affected what Gemini receives:
+
+1. **Zero-evidence guard:** zero-score excerpts are no longer sent (except summary and `full_document` chunks). L06 now sends only its matching Page 3.
+2. **`full_document` label:** for PDFs no longer than three chunks, zero-score retrieval sends the whole document labeled as such (L05, L07, L08).
+3. **System instruction:** the refusal rule was reworded and a sentence about `full_document` excerpts was added. This applies to every question.
+
+The retrieved evidence for L01–L04 and L09 is unchanged, but the instruction change means **no live case has been re-run on the final code**. A paced re-check (about 10 requests) is recommended before the demo. No API requests were made after the live run.
+
 ### Live status summary
 
 | Item | Status |
@@ -137,4 +153,4 @@ Model `gemini-2.5-flash` with the team's newly rotated key. A small harness wrap
 - Earlier run: **12 passed in 22.02 s** (original 12 tests).
 - Earlier run: **21/21 passed**, as reported by the development assistant.
 
-Both are superseded by the 30/30 run above.
+Both are superseded by the 35/35 run above.

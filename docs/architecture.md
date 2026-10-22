@@ -29,7 +29,7 @@ flowchart TD
     C --> T["TFIDFRetriever<br/>fit TF-IDF matrix"]
 
     Q["User question"] --> S{"Summary intent?"}
-    S -- yes --> SP["Summary path<br/>first chunk of distinct pages<br/>fixed score 0.95"]
+    S -- yes --> SP["Summary path<br/>chunks sampled across pages<br/>fixed score 0.95"]
     S -- no --> AR{"Arabic text?"}
     AR -- yes --> LX["Arabic keyword lexicon<br/>→ English search terms"]
     AR -- no --> TF
@@ -60,19 +60,24 @@ flowchart TD
 6. **Retrieval.** For each question:
    - Summary-intent questions go to `get_summary_chunks` (the scores are an assigned constant, **not** a similarity).
    - Arabic questions are passed through `translate_arabic_query_to_english`, a keyword lexicon. Several mapped term lists contain words specific to the synthetic test document (e.g. "Dr Elena Rostova", "March 15 2025").
-   - The result is the top 3 chunks by cosine similarity, **including zero-score chunks**. Zero scores are kept so the generator can refuse.
+   - The result is the top 3 chunks by cosine similarity, **including zero-score chunks**, so the offline engine can see there is no evidence.
+   - If every score is 0 and the document has no more chunks than requested (top 3), the chunks are labeled `full_document`: they are the entire short document.
 7. **Generation.** See §4.
-8. **Display.** The answer appears in the chat; an expander lists each retrieved chunk with page, chunk id, retrieval mode, and score.
+8. **Display.** The answer appears in the chat with a **source caption** (Gemini, local engine, local engine after a Gemini failure, or API error); an expander lists each retrieved chunk with page, chunk id, retrieval mode, and score.
 
 ## 4. Live Gemini path vs. offline simulation
 
 ### Live path (requires a valid key; verified with 9 live questions, see `test_results.md`)
 
+- Rejects questions longer than 2000 characters before any API call (`MAX_QUESTION_CHARS`).
+- **Zero-evidence guard (`_usable_evidence`):** zero-score excerpts are dropped before the request, unless they are summary or `full_document` chunks. If nothing remains, the prompt says no excerpts were found, so Gemini can only call the tool or refuse.
 - Builds a prompt that labels excerpts as **untrusted reference material** and includes page, chunk id, retrieval mode, and similarity for each excerpt.
 - Sends it with `SYSTEM_INSTRUCTION` (grounding rules, `[Page X]` citation format, refusal sentences in English and Arabic, prompt-injection rules), `temperature=0.0`, and `tools=[get_document_stats]`.
 - The SDK's **automatic function calling is disabled**. If the response contains a `get_document_stats` function call, the app runs the function once and sends the original prompt, the model's call, and a `function_response` in a single follow-up request **without tools**, so no tool loop is possible. This path is covered by mocked tests T28 and T30 and was verified live (L07 in `test_results.md`).
-- Errors: 401, 403, 404 and 429 responses return a clear warning (detected by searching the error text). Timeouts and **any other exception fall back to the offline simulation** with a notice appended to the answer.
-- Each HTTP request has a 20-second timeout (`GEMINI_TIMEOUT_MS = 20000`; the SDK expects milliseconds). Whether this resolves the earlier hang is **not confirmed** by an independent live test.
+- Errors: 401, 403, 404 and 429 responses return a clear warning (detected from the SDK error's status code, or the error text). Timeouts and **any other exception (e.g. 503)** fall back to the offline simulation with a notice appended to the answer.
+- `answer_question_with_source` returns `(answer, source)` with source `gemini`, `offline`, `offline_fallback`, `api_error`, or `rejected`; the UI turns this into the caption under each answer. `answer_question` returns only the text.
+- Each HTTP request has a 20-second timeout (`GEMINI_TIMEOUT_MS = 20000`; the SDK expects milliseconds). No hang occurred in 16 live requests; the original hang's root cause was not confirmed.
+- **Key lookup (`app.py`):** environment variable / `.env` first, then Streamlit secrets; the value is never displayed.
 
 ### Offline simulation (used by all automated tests)
 

@@ -1,6 +1,9 @@
-streamlit>=1.35.0
-pymupdf>=1.24.0
-scikit-learn>=1.4.0
-google-genai>=1.0.0
-python-dotenv>=1.0.0
-pytest>=8.0.0
+# Pinned to the versions the test suite was run against (2026-10-22).
+# Verified to resolve for Linux / Python 3.12 (Streamlit Community Cloud).
+streamlit==1.65.0
+pymupdf==1.28.2
+scikit-learn==1.7.2
+numpy==2.2.6
+google-genai==2.32.0
+python-dotenv==1.2.4
+pytest==9.1.1
