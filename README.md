@@ -22,6 +22,8 @@ This project was developed by **Team 2** as part of the **تطوير حلول ا
 
 Official academy website: [SDAIA Academy](https://sdaia.gov.sa/ar/Sectors/BuildingCapacity/academy/Pages/default.aspx)
 
+Official academy GitHub: [github.com/SDAIAAcademy](https://github.com/SDAIAAcademy)
+
 | # | Name |
 | :-: | :--- |
 | 1 | Ghala Ahmad Alshreef |
